@@ -1,0 +1,273 @@
+---
+title: "Data quality monitoring"
+description: "Validate feature data during historical retrieval using Great Expectations profiles and Feast's built-in DQM module."
+---
+
+The Feast Data Quality Monitoring (DQM) module lets you validate feature data against a set of rules you define. Validation runs after historical feature retrieval, catching distribution shifts, upstream pipeline bugs, and training/serving skew before they affect your models.
+
+<Note>
+  DQM currently supports validation during **historical retrieval** (training dataset generation). Validation at write time and read time from the online store is planned for future releases.
+</Note>
+
+---
+
+## Problems DQM addresses
+
+<CardGroup cols={2}>
+  <Card title="Data consistency" icon="scale-balanced">
+    New training datasets can differ significantly from previous ones, requiring changes to model architecture. DQM alerts you to these shifts automatically.
+  </Card>
+  <Card title="Upstream pipeline bugs" icon="bug">
+    Bugs in upstream pipelines can silently overwrite valid online store values with invalid ones. Validate data before it reaches your model.
+  </Card>
+  <Card title="Training/serving skew" icon="chart-line">
+    Distribution shifts between training and serving data can degrade model performance over time. Profiling reference datasets lets you catch skew early.
+  </Card>
+  <Card title="Automated quality gates" icon="shield-check">
+    Gate model training on data quality checks. If validation fails, the `to_df()` call raises a `ValidationFailed` exception rather than returning bad data.
+  </Card>
+</CardGroup>
+
+---
+
+## How it works
+
+The DQM workflow has three steps:
+
+<Steps>
+  <Step title="Prepare a reference dataset">
+    Save a historical feature retrieval as a **reference dataset**. This represents the expected distribution of your feature data.
+
+    ```python save_reference.py
+    from feast import FeatureStore
+
+    store = FeatureStore(repo_path=".")
+
+    job = store.get_historical_features(
+        entity_df=entity_df,
+        features=["driver_hourly_stats:conv_rate", "driver_hourly_stats:acc_rate"],
+    )
+
+    # Save the retrieved dataset as a named reference
+    dataset = store.create_saved_dataset(
+        from_=job,
+        name="driver_stats_reference",
+        storage=SavedDatasetFileStorage(path="data/reference/driver_stats"),
+    )
+    ```
+  </Step>
+
+  <Step title="Define a profiler function">
+    A profiler is a function decorated with `@ge_profiler` that receives a Great Expectations `Dataset` and returns an `ExpectationSuite`. The suite defines what "valid" data looks like.
+
+    <CodeGroup>
+    ```python manual_profiler.py
+    from great_expectations.dataset import Dataset
+    from great_expectations.core.expectation_suite import ExpectationSuite
+    from feast.dqm.profilers.ge_profiler import ge_profiler
+
+    @ge_profiler
+    def driver_stats_profiler(dataset: Dataset) -> ExpectationSuite:
+        # Conversion rate must be between 0 and 1
+        dataset.expect_column_values_to_be_between("conv_rate", 0.0, 1.0)
+        # Acceptance rate must not be null
+        dataset.expect_column_values_to_not_be_null("acc_rate")
+        # Daily trips should be non-negative
+        dataset.expect_column_min_to_be_between("avg_daily_trips", 0, None)
+        return dataset.get_expectation_suite()
+    ```
+
+    ```python automatic_profiler.py
+    from great_expectations.dataset import Dataset
+    from great_expectations.core.expectation_suite import ExpectationSuite
+    from great_expectations.profile.user_configurable_profiler import (
+        UserConfigurableProfiler,
+    )
+    from feast.dqm.profilers.ge_profiler import ge_profiler
+
+    @ge_profiler
+    def automatic_profiler(dataset: Dataset) -> ExpectationSuite:
+        # Let Great Expectations infer expectations from the data
+        return UserConfigurableProfiler(
+            profile_dataset=dataset,
+            ignored_columns=["conv_rate"],
+            value_set_threshold="few",
+        ).build_suite()
+    ```
+    </CodeGroup>
+
+    <Tip>
+      Automatic profilers are convenient but can generate overly strict expectations. We recommend crafting manual expectations for production workflows where you understand the expected distributions.
+    </Tip>
+  </Step>
+
+  <Step title="Validate new data against the reference">
+    Pass a `validation_reference` to `.to_df()` or `.to_arrow()`. Feast materializes the dataset and validates it against the profiler output before returning results.
+
+    ```python validate.py
+    from feast import FeatureStore
+
+    store = FeatureStore(repo_path=".")
+
+    job = store.get_historical_features(
+        entity_df=entity_df,
+        features=["driver_hourly_stats:conv_rate", "driver_hourly_stats:acc_rate"],
+    )
+
+    # Validation runs when you call .to_df() or .to_arrow()
+    df = job.to_df(
+        validation_reference=store
+            .get_saved_dataset("driver_stats_reference")
+            .as_reference(profiler=driver_stats_profiler)
+    )
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Installation
+
+Feast's Great Expectations integration is an optional dependency. Install it with:
+
+```bash
+pip install 'feast[ge]'
+```
+
+---
+
+## Handling validation failures
+
+If any expectation in the suite is not met, Feast raises a `ValidationFailed` exception. Catch it to inspect which expectations failed:
+
+```python handle_failure.py
+from feast import FeatureStore
+from feast.dqm.errors import ValidationFailed
+
+store = FeatureStore(repo_path=".")
+
+job = store.get_historical_features(
+    entity_df=entity_df,
+    features=["driver_hourly_stats:conv_rate", "driver_hourly_stats:acc_rate"],
+)
+
+try:
+    df = job.to_df(
+        validation_reference=store
+            .get_saved_dataset("driver_stats_reference")
+            .as_reference(profiler=driver_stats_profiler)
+    )
+    # Proceed with training
+    model.fit(df)
+
+except ValidationFailed as e:
+    # Log the failed expectations for alerting or debugging
+    print("Data quality validation failed:")
+    for result in e.validation_report.results:
+        if not result.success:
+            print(f"  - {result.expectation_config.expectation_type}: {result}")
+    raise
+```
+
+---
+
+## Full example
+
+```python full_dqm_example.py
+import pandas as pd
+from datetime import datetime, timezone, timedelta
+from feast import FeatureStore
+from feast.saved_dataset import SavedDatasetFileStorage
+from feast.dqm.profilers.ge_profiler import ge_profiler
+from feast.dqm.errors import ValidationFailed
+from great_expectations.dataset import Dataset
+from great_expectations.core.expectation_suite import ExpectationSuite
+
+store = FeatureStore(repo_path=".")
+
+# --- Step 1: Create a reference dataset ---
+entity_df = pd.DataFrame({
+    "driver_id": [1001, 1002, 1003],
+    "event_timestamp": [
+        datetime(2024, 1, 15, tzinfo=timezone.utc),
+        datetime(2024, 1, 15, tzinfo=timezone.utc),
+        datetime(2024, 1, 15, tzinfo=timezone.utc),
+    ],
+})
+
+reference_job = store.get_historical_features(
+    entity_df=entity_df,
+    features=["driver_hourly_stats:conv_rate", "driver_hourly_stats:acc_rate"],
+)
+
+store.create_saved_dataset(
+    from_=reference_job,
+    name="driver_stats_jan_reference",
+    storage=SavedDatasetFileStorage(path="data/reference/driver_stats_jan"),
+)
+
+# --- Step 2: Define a profiler ---
+@ge_profiler
+def driver_stats_profiler(dataset: Dataset) -> ExpectationSuite:
+    dataset.expect_column_values_to_be_between("conv_rate", 0.0, 1.0)
+    dataset.expect_column_values_to_not_be_null("acc_rate")
+    return dataset.get_expectation_suite()
+
+# --- Step 3: Validate a new dataset ---
+new_entity_df = pd.DataFrame({
+    "driver_id": [1001, 1002, 1003],
+    "event_timestamp": [
+        datetime(2024, 2, 15, tzinfo=timezone.utc),
+        datetime(2024, 2, 15, tzinfo=timezone.utc),
+        datetime(2024, 2, 15, tzinfo=timezone.utc),
+    ],
+})
+
+new_job = store.get_historical_features(
+    entity_df=new_entity_df,
+    features=["driver_hourly_stats:conv_rate", "driver_hourly_stats:acc_rate"],
+)
+
+try:
+    validated_df = new_job.to_df(
+        validation_reference=store
+            .get_saved_dataset("driver_stats_jan_reference")
+            .as_reference(profiler=driver_stats_profiler)
+    )
+    print(f"Validation passed. Training on {len(validated_df)} rows.")
+except ValidationFailed as e:
+    print("Validation failed — aborting training.")
+    raise
+```
+
+---
+
+## DQM module reference
+
+| Component | Description |
+|---|---|
+| `feast.dqm.profilers.ge_profiler.ge_profiler` | Decorator that wraps a function returning an `ExpectationSuite` |
+| `feast.dqm.errors.ValidationFailed` | Exception raised when one or more expectations fail |
+| `RetrievalJob.to_df(validation_reference=...)` | Run validation and return a DataFrame |
+| `RetrievalJob.to_arrow(validation_reference=...)` | Run validation and return a PyArrow table |
+| `FeatureStore.get_saved_dataset(name)` | Retrieve a previously saved reference dataset |
+| `SavedDataset.as_reference(profiler=...)` | Wrap a saved dataset as a `ValidationReference` |
+
+---
+
+## Limitations and roadmap
+
+<Accordion title="What is currently supported?">
+  - Validation during **historical retrieval** (training dataset generation)
+  - Great Expectations `ExpectationSuite` as the profile format
+  - Both automatic and manual expectation definitions
+</Accordion>
+
+<Accordion title="What is planned?">
+  - Validation when **writing features to the online store**
+  - Validation when **reading features from the online store**
+</Accordion>
+
+<Accordion title="Can I use a profiler other than Great Expectations?">
+  Currently only Great Expectations is supported. The `ge_profiler` decorator and `ExpectationSuite` are required. Custom profiler implementations are not yet supported out of the box.
+</Accordion>

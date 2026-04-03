@@ -1,0 +1,342 @@
+---
+title: "Running in production"
+description: "Deploy Feast in production with the right store configuration, remote registry, CI/CD, and scaling patterns for cloud and Kubernetes environments."
+---
+
+Feast is designed to be modular — you can adopt only the components you need. This guide walks through the key decisions and steps for taking a Feast project from local development to a production-grade deployment.
+
+<Note>
+  Feast is highly customizable. You may not need every component described here. For example, if you have no stream source you don't need push ingestion, and if you only serve batch predictions you may not need an online store at all.
+</Note>
+
+## Production checklist
+
+Before going live, work through each of the following areas.
+
+<Steps>
+  <Step title="Use a database-backed registry">
+    The default file-based registry serializes all state into a single file. Concurrent writers (e.g. parallel materialization jobs) can cause data loss or write bottlenecks because every change rewrites the whole file.
+
+    Switch to the SQL-based registry backed by Postgres, MySQL, or another SQLAlchemy-compatible database:
+
+    ```yaml feature_store.yaml
+    project: my_project
+    registry:
+      registry_type: sql
+      path: postgresql://user:password@db-host:5432/feast_registry
+    provider: local
+    online_store:
+      type: redis
+      connection_string: redis://redis-host:6379
+    offline_store:
+      type: bigquery
+      dataset: feast_offline
+    entity_key_serialization_version: 3
+    ```
+
+    <Warning>
+      The SQL-based registry works with the Python feature server. The Java feature server does not support this registry type.
+    </Warning>
+  </Step>
+
+  <Step title="Set up CI/CD to apply feature definitions">
+    Keep your feature definitions in a Git repository and automate `feast apply` on merge. A typical pull request workflow looks like:
+
+    - **On PR open**: run `feast plan` to preview infrastructure changes as a PR comment.
+    - **On PR merge**: run `feast apply` to commit the updated definitions to the registry.
+
+    ```yaml .github/workflows/feast-apply.yml
+    name: Feast Apply
+    on:
+      push:
+        branches: [main]
+    jobs:
+      apply:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v3
+          - run: pip install feast
+          - run: feast apply
+            working-directory: feature_repo/
+    ```
+  </Step>
+
+  <Step title="Configure staging and production environments">
+    Mirror your production environment with a separate staging deployment — same store types, smaller dataset. Apply changes to staging first, verify them, then promote to production.
+
+    Use environment-specific `feature_store.yaml` files or inject values via environment variables:
+
+    ```yaml feature_store.yaml
+    project: my_project
+    registry:
+      registry_type: sql
+      path: ${FEAST_REGISTRY_DB_URL}
+    online_store:
+      type: redis
+      connection_string: ${REDIS_CONNECTION_STRING}
+    offline_store:
+      type: bigquery
+      dataset: ${BQ_DATASET}
+    entity_key_serialization_version: 3
+    ```
+
+    The `${ENV_VAR}` syntax is supported throughout `feature_store.yaml`, making it safe to commit the file to version control without exposing secrets.
+  </Step>
+
+  <Step title="Schedule materialization">
+    Online store data must be kept fresh through regular materialization runs. Use a scheduler such as Airflow to trigger incremental materialization:
+
+    ```python airflow_dag.py
+    from airflow.decorators import task
+    from feast import RepoConfig, FeatureStore
+    from feast.infra.online_stores.redis import RedisOnlineStoreConfig
+    from feast.repo_config import RegistryConfig
+
+    @task()
+    def materialize(data_interval_start=None, data_interval_end=None):
+        repo_config = RepoConfig(
+            registry=RegistryConfig(
+                registry_type="sql",
+                path="postgresql://user:password@db-host/feast_registry",
+            ),
+            project="my_project",
+            provider="local",
+            offline_store="bigquery",
+            online_store=RedisOnlineStoreConfig(connection_string="redis://redis-host:6379"),
+            entity_key_serialization_version=3,
+        )
+        store = FeatureStore(config=repo_config)
+        # Add 1 hour overlap to handle late-arriving data
+        store.materialize(
+            data_interval_start.subtract(hours=1),
+            data_interval_end,
+        )
+    ```
+  </Step>
+
+  <Step title="Serve online features">
+    Choose how your applications retrieve online features:
+
+    - **Python SDK** (lowest infrastructure overhead): embed the SDK directly in your Python service.
+    - **Python feature server** (language-agnostic): deploy a REST endpoint using `feast serve`.
+    - **Kubernetes + Feast Operator**: horizontally scalable deployment managed by the Feast Operator CRD.
+
+    ```python serving_example.py
+    from feast import FeatureStore
+
+    store = FeatureStore(repo_path="feature_repo/")
+
+    feature_vector = store.get_online_features(
+        features=store.get_feature_service("driver_activity_v2"),
+        entity_rows=[{"driver_id": 1001}],
+    ).to_dict()
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Architecture patterns
+
+<Tabs>
+  <Tab title="Simple / local">
+    Suitable for single-machine deployments, internal tools, or getting started with production habits before scaling.
+
+    ```yaml feature_store.yaml
+    project: my_project
+    registry:
+      registry_type: sql
+      path: postgresql://localhost:5432/feast
+    provider: local
+    offline_store:
+      type: duckdb
+    online_store:
+      type: redis
+      connection_string: localhost:6379
+    entity_key_serialization_version: 3
+    ```
+
+    <Info>
+      File-based offline stores like DuckDB work for low-volume workloads. For horizontal scaling, switch to a DB-backed offline store.
+    </Info>
+  </Tab>
+
+  <Tab title="AWS">
+    Use S3 or an RDS instance for the registry, Redshift for the offline store, and DynamoDB or Redis for the online store.
+
+    ```yaml feature_store.yaml
+    project: my_project
+    registry:
+      registry_type: sql
+      path: postgresql://user:password@rds-host.us-east-1.rds.amazonaws.com:5432/feast
+    provider: aws
+    offline_store:
+      type: redshift
+      region: us-east-1
+      cluster_id: my-redshift-cluster
+      database: feast
+      user: feast_user
+      s3_staging_location: s3://my-bucket/feast-staging/
+      iam_role: arn:aws:iam::123456789012:role/FeastRole
+    online_store:
+      type: dynamodb
+      region: us-east-1
+    entity_key_serialization_version: 3
+    ```
+  </Tab>
+
+  <Tab title="GCP">
+    Use Cloud SQL or a GCS-backed file registry, BigQuery for the offline store, and Bigtable or Redis for online serving.
+
+    ```yaml feature_store.yaml
+    project: my_project
+    registry:
+      registry_type: sql
+      path: postgresql://user:password@/feast?host=/cloudsql/project:region:instance
+    provider: gcp
+    offline_store:
+      type: bigquery
+      dataset: feast_offline
+      project: my-gcp-project
+    online_store:
+      type: bigtable
+      project_id: my-gcp-project
+      instance: feast-online
+    entity_key_serialization_version: 3
+    ```
+  </Tab>
+
+  <Tab title="Azure">
+    Use Azure Database for PostgreSQL for the registry, Azure Synapse or Azure SQL for the offline store, and Redis Cache for the online store.
+
+    ```yaml feature_store.yaml
+    project: my_project
+    registry:
+      registry_type: sql
+      path: postgresql://user:password@my-server.postgres.database.azure.com:5432/feast
+    provider: azure
+    offline_store:
+      type: mssql
+      connection_string: ${AZURE_SQL_CONNECTION_STRING}
+    online_store:
+      type: redis
+      connection_string: ${AZURE_REDIS_CONNECTION_STRING}
+    entity_key_serialization_version: 3
+    ```
+  </Tab>
+
+  <Tab title="Kubernetes">
+    Use the Feast Operator to manage a horizontally scalable FeatureStore deployment. Requires DB-backed persistence for all services.
+
+    ```yaml feast-featurestore.yaml
+    apiVersion: feast.dev/v1
+    kind: FeatureStore
+    metadata:
+      name: my-feast
+      namespace: feast
+    spec:
+      feastProject: my_project
+      replicas: 3
+      services:
+        onlineStore:
+          persistence:
+            store:
+              type: postgres
+              secretRef:
+                name: feast-data-stores
+        registry:
+          local:
+            persistence:
+              store:
+                type: sql
+                secretRef:
+                  name: feast-data-stores
+        podDisruptionBudgets:
+          maxUnavailable: 1
+    ```
+
+    Scale with `kubectl`:
+
+    ```bash
+    kubectl scale featurestore/my-feast --replicas=5
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Scaling considerations
+
+<CardGroup cols={2}>
+  <Card title="Scale the registry" icon="database">
+    The SQL registry supports concurrent, transactional updates. Required when running parallel materialization jobs or multiple feature server replicas.
+  </Card>
+  <Card title="Scale materialization" icon="gears">
+    The default in-process engine loads all data into memory. For large datasets, use the Snowflake Compute Engine or Bytewax engine, or write a custom engine.
+  </Card>
+  <Card title="Horizontal scaling on Kubernetes" icon="server">
+    Use `spec.replicas` for static scaling or configure HPA under `services.scaling.autoscaling`. File-based persistence is incompatible with multiple replicas.
+  </Card>
+  <Card title="Stream ingestion" icon="bolt">
+    Use the Feast Push API inside existing Spark or Beam pipelines to write feature values to the online or offline store without waiting for batch materialization.
+  </Card>
+</CardGroup>
+
+---
+
+## Structuring the feature repository for teams
+
+Organize features by domain or team and use `FeatureService` to version the features consumed by each model:
+
+```
+feature_repo/
+├── feature_store.yaml
+├── entities.py          # shared entity definitions
+├── data_sources.py      # shared data source pointers
+├── driver_features.py   # driver domain features
+├── rider_features.py    # rider domain features
+└── feature_services.py  # model-specific feature services (versioned)
+```
+
+```python feature_services.py
+from feast import FeatureService
+from driver_features import driver_hourly_stats_view
+from rider_features import rider_activity_view
+
+driver_ranking_v1 = FeatureService(
+    name="driver_ranking_v1",
+    features=[
+        driver_hourly_stats_view[["conv_rate", "acc_rate"]],
+        rider_activity_view[["avg_wait_time"]],
+    ],
+)
+```
+
+<Tip>
+  Pin model versions to a specific `FeatureService` version. When you update features, create a new `FeatureService` (e.g. `driver_ranking_v2`) and promote it separately from the model deployment.
+</Tip>
+
+---
+
+## Generating training data
+
+```python training.py
+from feast import FeatureStore
+
+store = FeatureStore(repo_path="feature_repo/")
+
+training_job = store.get_historical_features(
+    entity_df=entity_df,
+    features=store.get_feature_service("driver_ranking_v1"),
+)
+
+# Load into memory for local training
+df = training_job.to_df()
+
+# Or export to remote storage for distributed training
+training_job.to_remote_storage()
+```
+
+<Note>
+  Training pipelines and model serving services only need **read access** to the registry and stores. Avoid granting write permissions to inference services.
+</Note>

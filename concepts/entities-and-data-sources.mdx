@@ -1,0 +1,322 @@
+---
+title: "Entities and Data Sources"
+description: "Understand how entities join features to business objects, and how data sources connect Feast to your underlying data infrastructure."
+---
+
+## Entities
+
+An **entity** is a collection of semantically related features grouped around a real-world object in your domain. A ride-hailing service might define `driver` and `customer` as entities; a fraud detection system might define `user`, `merchant`, and `card`.
+
+```python
+from feast import Entity
+
+driver = Entity(name="driver", join_keys=["driver_id"])
+```
+
+The `name` uniquely identifies the entity in the project (e.g. in the web UI). The `join_keys` list specifies the physical primary key column(s) used to join feature values at retrieval time.
+
+### Entity constructor
+
+```python
+from feast import Entity
+from feast.value_type import ValueType
+
+driver = Entity(
+    name="driver",
+    join_keys=["driver_id"],
+    value_type=ValueType.INT64,      # optional; inferred from schema if omitted
+    description="A driver in the ride-hailing platform",
+    tags={"team": "driver-team"},
+    owner="driver-team@example.com",
+)
+```
+
+| Parameter | Required | Description |
+|---|---|---|
+| `name` | Yes | Unique entity name within the project |
+| `join_keys` | No | List of join key column names (defaults to `[name]`) |
+| `value_type` | No | Type of the join key; inferred from data source if omitted |
+| `description` | No | Human-readable description |
+| `tags` | No | Key-value metadata dictionary |
+| `owner` | No | Email or identifier of the primary maintainer |
+
+### Entity cardinality
+
+Feature views can map to different numbers of entities:
+
+<Tabs>
+  <Tab title="Zero entities (global)">
+    ```python
+    from feast import FeatureView, Field, BigQuerySource
+    from feast.types import Int64
+
+    global_stats_fv = FeatureView(
+        name="global_stats",
+        entities=[],  # No entity
+        schema=[Field(name="total_trips_today", dtype=Int64)],
+        source=BigQuerySource(table="feast-oss.demo_data.global_stats"),
+    )
+    ```
+  </Tab>
+  <Tab title="One entity">
+    ```python
+    user = Entity(name="user", join_keys=["user_id"])
+
+    user_features_fv = FeatureView(
+        name="user_features",
+        entities=[user],
+        schema=[Field(name="user_age", dtype=Int64)],
+        source=BigQuerySource(table="feast-oss.demo_data.user_features"),
+    )
+    ```
+  </Tab>
+  <Tab title="Composite key (multiple entities)">
+    ```python
+    user = Entity(name="user", join_keys=["user_id"])
+    merchant = Entity(name="merchant", join_keys=["merchant_id"])
+
+    user_merchant_fv = FeatureView(
+        name="user_merchant_stats",
+        entities=[user, merchant],  # Composite key
+        schema=[Field(name="purchase_count_30d", dtype=Int64)],
+        source=BigQuerySource(table="feast-oss.demo_data.user_merchant_stats"),
+    )
+    ```
+  </Tab>
+</Tabs>
+
+### How entities are used
+
+<Steps>
+  <Step title="Define and store features">
+    Entities group features in a feature view, which determines the storage schema in both offline and online stores.
+  </Step>
+  <Step title="Generate training data">
+    At training time, you build an entity dataframe (entity keys + timestamps) and Feast performs point-in-time joins to retrieve matching feature values.
+  </Step>
+  <Step title="Serve online features">
+    At serving time, you supply entity keys to `get_online_features` to fetch the latest feature values for real-time inference.
+  </Step>
+</Steps>
+
+<Tip>
+Reuse entities across multiple feature views. This improves discoverability — data scientists can quickly find all features defined for an entity they care about.
+</Tip>
+
+---
+
+## Data Sources
+
+A **data source** tells Feast where raw feature data lives. Feast uses a time-series data model: every source must have a timestamp column. Feast does not manage the underlying data — it reads from it to build training datasets or materialize features into an online store.
+
+### Batch data sources
+
+Batch sources are the foundation for offline feature retrieval and materialization.
+
+<Tabs>
+  <Tab title="FileSource">
+    Local or cloud-hosted Parquet/CSV files. Works with the Dask and DuckDB offline stores.
+
+    ```python
+    from feast import FileSource
+
+    driver_stats_source = FileSource(
+        name="driver_stats_source",
+        path="data/driver_stats.parquet",
+        timestamp_field="event_timestamp",
+        created_timestamp_column="created",
+    )
+    ```
+  </Tab>
+  <Tab title="BigQuerySource">
+    Google BigQuery tables or queries. Requires `feast[gcp]`.
+
+    ```python
+    from feast import BigQuerySource
+
+    driver_stats_source = BigQuerySource(
+        name="driver_stats_bq",
+        table="feast-oss.demo_data.driver_activity",
+        timestamp_field="event_timestamp",
+    )
+
+    # Or use a query instead of a table
+    driver_stats_query_source = BigQuerySource(
+        query="SELECT * FROM feast-oss.demo_data.driver_activity WHERE event_date > '2024-01-01'",
+        timestamp_field="event_timestamp",
+    )
+    ```
+  </Tab>
+  <Tab title="SnowflakeSource">
+    Snowflake tables or queries. Requires `feast[snowflake]`.
+
+    ```python
+    from feast.infra.offline_stores.contrib.snowflake_offline_store.snowflake_source import SnowflakeSource
+
+    driver_stats_source = SnowflakeSource(
+        name="driver_stats_snowflake",
+        database="FEAST",
+        schema="PUBLIC",
+        table="DRIVER_STATS",
+        timestamp_field="EVENT_TIMESTAMP",
+    )
+    ```
+  </Tab>
+  <Tab title="RedshiftSource">
+    Amazon Redshift tables or queries. Requires `feast[aws]`.
+
+    ```python
+    from feast.infra.offline_stores.redshift_source import RedshiftSource
+
+    driver_stats_source = RedshiftSource(
+        name="driver_stats_redshift",
+        table="driver_stats",
+        timestamp_field="event_timestamp",
+        database="feast",
+        schema="public",
+    )
+    ```
+  </Tab>
+</Tabs>
+
+### Stream data sources
+
+Stream sources allow Feast to register metadata about streaming pipelines and ingest fresh features into the online (and optionally offline) store.
+
+<Tabs>
+  <Tab title="PushSource">
+    A push source enables you to push pre-computed feature values directly into Feast's online or offline store via the Push API — no streaming infrastructure required.
+
+    ```python
+    from feast import Entity, PushSource, FeatureView, Field, BigQuerySource
+    from feast.types import Int64
+
+    push_source = PushSource(
+        name="driver_push_source",
+        batch_source=BigQuerySource(table="feast-oss.demo_data.driver_activity"),
+    )
+
+    driver = Entity(name="driver", join_keys=["driver_id"])
+
+    driver_push_fv = FeatureView(
+        name="driver_push_features",
+        entities=[driver],
+        schema=[Field(name="trips_today", dtype=Int64)],
+        source=push_source,
+    )
+    ```
+
+    Push data at runtime:
+
+    ```python
+    import pandas as pd
+    from feast import FeatureStore
+    from feast.data_source import PushMode
+
+    store = FeatureStore(repo_path=".")
+    df = pd.DataFrame({"driver_id": [1001], "trips_today": [42], "event_timestamp": [pd.Timestamp.now()]})
+
+    # Push to both online and offline stores
+    store.push("driver_push_source", df, to=PushMode.ONLINE_AND_OFFLINE)
+    ```
+  </Tab>
+  <Tab title="KafkaSource">
+    Register a Kafka topic as a data source. Feast does not launch ingestion jobs; users are responsible for writing data from Kafka to both the online store and a batch source.
+
+    ```python
+    from datetime import timedelta
+    from feast import Field, FileSource, KafkaSource
+    from feast.data_format import JsonFormat
+    from feast.types import Float32
+
+    driver_stats_batch_source = FileSource(
+        name="driver_stats_source",
+        path="data/driver_stats.parquet",
+        timestamp_field="event_timestamp",
+    )
+
+    driver_stats_stream_source = KafkaSource(
+        name="driver_stats_stream",
+        kafka_bootstrap_servers="localhost:9092",
+        topic="drivers",
+        timestamp_field="event_timestamp",
+        batch_source=driver_stats_batch_source,
+        message_format=JsonFormat(
+            schema_json="driver_id integer, event_timestamp timestamp, conv_rate double, acc_rate double, created timestamp"
+        ),
+        watermark_delay_threshold=timedelta(minutes=5),
+    )
+    ```
+  </Tab>
+  <Tab title="KinesisSource">
+    Register an Amazon Kinesis stream as a data source. Like KafkaSource, users handle ingestion.
+
+    ```python
+    from feast import KinesisSource, FileSource
+    from feast.data_format import JsonFormat
+
+    driver_stats_batch_source = FileSource(
+        name="driver_stats_source",
+        path="data/driver_stats.parquet",
+        timestamp_field="event_timestamp",
+    )
+
+    driver_stats_stream_source = KinesisSource(
+        name="driver_stats_kinesis",
+        stream_name="driver-stats-stream",
+        region="us-east-1",
+        timestamp_field="event_timestamp",
+        batch_source=driver_stats_batch_source,
+        message_format=JsonFormat(
+            schema_json="driver_id integer, event_timestamp timestamp, conv_rate double, acc_rate double"
+        ),
+    )
+    ```
+  </Tab>
+</Tabs>
+
+### Request source
+
+A `RequestSource` contains features that are only available at request time — for example, context from a user's current HTTP request. It is used exclusively as an input to `OnDemandFeatureView`.
+
+```python
+from feast import Field, RequestSource
+from feast.types import PrimitiveFeastType
+
+input_request = RequestSource(
+    name="transaction_context",
+    schema=[
+        Field(name="transaction_amount", dtype=PrimitiveFeastType.FLOAT64),
+        Field(name="is_mobile", dtype=PrimitiveFeastType.BOOL),
+    ],
+)
+```
+
+---
+
+## Data source type compatibility
+
+| Source | Compatible offline store(s) | Compatible online store(s) |
+|--------|----------------------------|----------------------------|
+| `FileSource` | Dask, DuckDB | (via materialization) all online stores |
+| `BigQuerySource` | BigQuery | (via materialization) all online stores |
+| `SnowflakeSource` | Snowflake | (via materialization) all online stores |
+| `RedshiftSource` | Redshift | (via materialization) all online stores |
+| `PushSource` | Any (via `batch_source`) | All online stores (direct push) |
+| `KafkaSource` | Batch source required | All online stores (user-managed ingestion) |
+| `KinesisSource` | Batch source required | All online stores (user-managed ingestion) |
+
+<CardGroup cols={2}>
+  <Card title="Feature Views" icon="table" href="/concepts/feature-views">
+    Learn how to group features using entities and data sources.
+  </Card>
+  <Card title="Offline and Online Stores" icon="database" href="/concepts/offline-online-stores">
+    Understand how Feast reads from data sources to power offline and online retrieval.
+  </Card>
+  <Card title="Feature Retrieval" icon="magnifying-glass" href="/concepts/feature-retrieval">
+    Learn how Feast performs point-in-time joins using entity dataframes.
+  </Card>
+  <Card title="Data Source Reference" icon="book" href="/reference/data-sources">
+    Full reference documentation for all supported data source types.
+  </Card>
+</CardGroup>

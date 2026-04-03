@@ -1,0 +1,317 @@
+---
+title: "Cloud Providers"
+description: "Deploy Feast on AWS, GCP, or Azure. Configure cloud-native offline stores, online stores, and registries for each provider."
+---
+
+Feast integrates natively with AWS, GCP, and Azure infrastructure. Each cloud provider offers its own set of offline stores, online stores, and registry backends. Select the tab for your cloud provider to see the recommended setup.
+
+## Install cloud-specific extras
+
+Install Feast with the extras for your chosen cloud provider before configuring any cloud resources:
+
+<Tabs>
+  <Tab title="AWS">
+    ```bash
+    # AWS: Redshift offline store + DynamoDB or Redis online store
+    pip install 'feast[aws]'
+
+    # Also install Redis support if using ElastiCache or standalone Redis
+    pip install 'feast[aws,redis]'
+    ```
+  </Tab>
+  <Tab title="GCP">
+    ```bash
+    # GCP: BigQuery offline store + Datastore or Bigtable online store
+    pip install 'feast[gcp]'
+    ```
+  </Tab>
+  <Tab title="Azure">
+    ```bash
+    # Azure: Azure SQL offline store + Azure Cache for Redis online store
+    pip install 'feast[azure]'
+
+    # Also install Redis support for Azure Cache
+    pip install 'feast[azure,redis]'
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## feature_store.yaml by cloud provider
+
+<Tabs>
+  <Tab title="AWS">
+    ### AWS: S3 registry, Redshift offline, DynamoDB online
+
+    **Prerequisites:**
+    - An S3 bucket for the registry (e.g. `s3://my-feast-bucket/registry.db`)
+    - A Redshift cluster with a configured database, user, and S3 staging location
+    - An IAM role granting Redshift access to the S3 staging bucket
+    - DynamoDB tables will be created automatically by `feast apply`
+
+    ```yaml
+    # feature_store.yaml (AWS)
+    project: my_aws_project
+    provider: aws
+    registry: s3://my-feast-bucket/registry.db
+
+    online_store:
+      type: dynamodb
+      region: us-east-1
+
+    offline_store:
+      type: redshift
+      region: us-east-1
+      cluster_id: my-redshift-cluster
+      database: my_database
+      user: my_redshift_user
+      s3_staging_location: s3://my-feast-bucket/redshift-staging/
+      iam_role: arn:aws:iam::123456789012:role/MyRedshiftS3Role
+
+    entity_key_serialization_version: 2
+    ```
+
+    ### AWS with Redis online store (ElastiCache)
+
+    Redis is a high-performance alternative to DynamoDB for the online store, suitable for sub-millisecond latency requirements:
+
+    ```yaml
+    # feature_store.yaml (AWS + Redis)
+    project: my_aws_project
+    provider: aws
+    registry: s3://my-feast-bucket/registry.db
+
+    online_store:
+      type: redis
+      connection_string: my-elasticache-cluster.abc123.0001.use1.cache.amazonaws.com:6379
+
+    offline_store:
+      type: redshift
+      region: us-east-1
+      cluster_id: my-redshift-cluster
+      database: my_database
+      user: my_redshift_user
+      s3_staging_location: s3://my-feast-bucket/redshift-staging/
+      iam_role: arn:aws:iam::123456789012:role/MyRedshiftS3Role
+
+    entity_key_serialization_version: 2
+    ```
+
+    ### Initialize the AWS feature repository
+
+    Use the interactive AWS template to scaffold a repository pre-configured for your cluster:
+
+    ```bash
+    feast init -t aws
+    # AWS Region (e.g. us-west-2): us-east-1
+    # Redshift Cluster ID: my-redshift-cluster
+    # Redshift Database Name: my_database
+    # Redshift User Name: my_redshift_user
+    # Redshift S3 Staging Location (s3://*): s3://my-feast-bucket/staging/
+    # Redshift IAM Role for S3 (arn:aws:iam::*:role/*): arn:aws:iam::123456789012:role/MyRole
+    # Should I upload example data to Redshift? (Y/n): Y
+    ```
+
+    ### Required AWS IAM permissions
+
+    | Operation | Service | Required permissions |
+    |---|---|---|
+    | `feast apply` | S3 | `s3:PutObject`, `s3:GetObject` |
+    | `feast apply` | DynamoDB | `dynamodb:CreateTable`, `dynamodb:DescribeTable` |
+    | `feast materialize` | Redshift | `redshift:GetClusterCredentials` |
+    | `feast materialize` | S3 (staging) | `s3:PutObject`, `s3:GetObject`, `s3:ListBucket` |
+    | `get_online_features` | DynamoDB | `dynamodb:GetItem`, `dynamodb:BatchGetItem` |
+
+    <Info>
+      Feast uses the standard AWS credential chain (`~/.aws/credentials`, environment variables, instance profiles, ECS task roles, etc.). Ensure credentials are available in your execution environment.
+    </Info>
+  </Tab>
+
+  <Tab title="GCP">
+    ### GCP: GCS registry, BigQuery offline, Datastore online
+
+    **Prerequisites:**
+    - A GCS bucket for the registry (e.g. `gs://my-feast-bucket/registry.db`)
+    - A BigQuery dataset for the offline store
+    - Google Cloud Datastore enabled in your project
+    - Application Default Credentials configured (`gcloud auth application-default login`)
+
+    ```yaml
+    # feature_store.yaml (GCP)
+    project: my_gcp_project
+    provider: gcp
+    registry: gs://my-feast-bucket/registry.db
+
+    online_store:
+      type: datastore
+      project_id: my-gcp-project-id
+
+    offline_store:
+      type: bigquery
+      project: my-gcp-project-id
+      dataset: feast_offline_store
+
+    entity_key_serialization_version: 2
+    ```
+
+    ### GCP with Bigtable online store
+
+    Bigtable is recommended for high-throughput, low-latency production workloads:
+
+    ```yaml
+    # feature_store.yaml (GCP + Bigtable)
+    project: my_gcp_project
+    provider: gcp
+    registry: gs://my-feast-bucket/registry.db
+
+    online_store:
+      type: bigtable
+      project_id: my-gcp-project-id
+      instance: my-bigtable-instance
+
+    offline_store:
+      type: bigquery
+      project: my-gcp-project-id
+      dataset: feast_offline_store
+
+    entity_key_serialization_version: 2
+    ```
+
+    ### Initialize the GCP feature repository
+
+    ```bash
+    feast init -t gcp
+    cd my_project/feature_repo
+    # Edit feature_store.yaml to set your GCS bucket and BigQuery dataset
+    ```
+
+    ### Required GCP IAM permissions
+
+    | Operation | Service | Recommended role |
+    |---|---|---|
+    | `feast apply` | BigQuery | `roles/bigquery.user` |
+    | `feast apply` | Datastore | `roles/datastore.owner` |
+    | `feast materialize` | BigQuery (source) | `roles/bigquery.user` |
+    | `feast materialize` | Datastore (destination) | `roles/datastore.owner` |
+    | `get_online_features` | Datastore | `roles/datastore.user` |
+    | `get_historical_features` | BigQuery | `roles/bigquery.dataEditor` |
+
+    <Info>
+      Feast uses Application Default Credentials (ADC). Run `gcloud auth application-default login` locally, or attach a service account to your VM / GKE workload identity for production.
+    </Info>
+  </Tab>
+
+  <Tab title="Azure">
+    ### Azure: Blob Storage registry, Azure SQL offline, Redis online
+
+    **Prerequisites:**
+    - An Azure Blob Storage container for the registry
+    - An Azure SQL Database instance
+    - An Azure Cache for Redis instance (or standalone Redis)
+    - Azure credentials configured (service principal or managed identity)
+
+    ```yaml
+    # feature_store.yaml (Azure)
+    project: my_azure_project
+    provider: azure
+    registry: az://my-container/registry.db
+
+    online_store:
+      type: redis
+      connection_string: my-redis.redis.cache.windows.net:6380,password=mypassword,ssl=True
+
+    offline_store:
+      type: mssql
+      connection_string: "mssql+pyodbc://myuser:mypassword@my-server.database.windows.net/mydb?driver=ODBC+Driver+17+for+SQL+Server"
+
+    entity_key_serialization_version: 2
+    ```
+
+    ### Install Azure and Redis extras
+
+    ```bash
+    pip install 'feast[azure,redis]'
+    ```
+
+    ### Azure Blob Storage registry configuration
+
+    The registry path uses the `az://` scheme. Set your Azure Storage credentials via environment variables:
+
+    ```bash
+    export AZURE_STORAGE_ACCOUNT=mystorageaccount
+    export AZURE_STORAGE_ACCESS_KEY=myaccesskey
+    # Or use a connection string:
+    export AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=https;..."
+    ```
+
+    <Info>
+      Feast also supports Managed Identity for authentication. When running on Azure VMs, AKS, or Azure Functions with a managed identity assigned, no explicit credential configuration is needed.
+    </Info>
+
+    ### Required Azure permissions
+
+    | Operation | Service | Required permission |
+    |---|---|---|
+    | Registry read/write | Azure Blob Storage | `Storage Blob Data Contributor` |
+    | `feast materialize` (read) | Azure SQL | `db_datareader` |
+    | `feast materialize` (write) | Redis | Redis write commands |
+    | `get_online_features` | Redis | Redis read commands |
+  </Tab>
+</Tabs>
+
+---
+
+## Deploy to the cloud
+
+After configuring `feature_store.yaml`, the workflow is the same across all cloud providers:
+
+<Steps>
+  <Step title="Apply feature definitions">
+    Register your feature views, entities, and services. Feast creates any required cloud resources (DynamoDB tables, Datastore namespaces, etc.):
+
+    ```bash
+    feast apply
+    ```
+  </Step>
+
+  <Step title="Materialize features">
+    Load historical data from your offline store into the online store:
+
+    ```bash
+    feast materialize-incremental $(date -u +"%Y-%m-%dT%H:%M:%S")
+    ```
+  </Step>
+
+  <Step title="Serve features">
+    Start the feature server:
+
+    ```bash
+    feast serve
+    ```
+
+    Or deploy to Kubernetes using the Feast Operator or Helm chart — see the [Kubernetes deployment guide](/deployment/kubernetes).
+  </Step>
+</Steps>
+
+## Cloud provider comparison
+
+| | AWS | GCP | Azure |
+|---|---|---|---|
+| **Registry** | S3 | GCS | Azure Blob Storage |
+| **Offline store** | Redshift | BigQuery | Azure SQL (MSSQL) |
+| **Online store (default)** | DynamoDB | Datastore | — |
+| **Online store (high perf)** | Redis (ElastiCache) | Bigtable | Redis (Azure Cache) |
+| **Install extras** | `feast[aws]` | `feast[gcp]` | `feast[azure,redis]` |
+| **Auth** | IAM / credential chain | Application Default Credentials | Service principal / Managed Identity |
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Kubernetes Deployment" icon="docker" href="/deployment/kubernetes">
+    Deploy Feast on Kubernetes using the Operator or Helm charts
+  </Card>
+  <Card title="Feature Server" icon="server" href="/deployment/feature-server">
+    Configure and deploy the REST feature server
+  </Card>
+</CardGroup>

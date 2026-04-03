@@ -1,0 +1,494 @@
+---
+title: "Kubernetes Deployment"
+description: "Deploy Feast on Kubernetes using the Feast Operator or Helm charts. Covers registry configuration, feature server deployment, service setup, and TLS."
+---
+
+Kubernetes is the recommended environment for running Feast in production. You can use Kubernetes to run feature servers for online retrieval, execute materialization jobs, and operate all Feast components using Kubernetes-native primitives.
+
+## Deployment options
+
+<CardGroup cols={2}>
+  <Card title="Feast Operator" icon="gear" href="#feast-operator">
+    The recommended approach. A Kubernetes operator that manages the full Feast lifecycle via a `FeatureStore` custom resource.
+  </Card>
+  <Card title="Helm Chart" icon="helm" href="#helm-chart">
+    Deploy individual Feast components (online server, offline server, UI, registry) using the `feast-feature-server` Helm chart.
+  </Card>
+</CardGroup>
+
+---
+
+## Feast Operator
+
+The Feast Operator is the recommended way to deploy and manage Feast on Kubernetes. It introduces a `FeatureStore` custom resource (CR) that declaratively describes all Feast services.
+
+### Install the Operator
+
+<Steps>
+  <Step title="Install kubectl">
+    Install the [kubectl CLI](https://kubernetes.io/docs/tasks/tools/install-kubectl/) and ensure it is configured to point to your cluster.
+  </Step>
+
+  <Step title="Apply the Operator manifest">
+    Install the latest stable release of the Feast Operator:
+
+    ```bash
+    kubectl apply -f https://raw.githubusercontent.com/feast-dev/feast/refs/heads/stable/infra/feast-operator/dist/install.yaml
+    ```
+
+    To install a specific version instead:
+
+    ```bash
+    kubectl apply -f https://raw.githubusercontent.com/feast-dev/feast/refs/tags/<version>/infra/feast-operator/dist/install.yaml
+    ```
+  </Step>
+
+  <Step title="Deploy a FeatureStore">
+    Apply a minimal `FeatureStore` custom resource. By default this deploys an online store feature server:
+
+    ```bash
+    kubectl apply -f https://raw.githubusercontent.com/feast-dev/feast/refs/heads/stable/infra/feast-operator/config/samples/v1_featurestore.yaml
+    ```
+
+    Or create your own manifest:
+
+    ```yaml
+    # featurestore.yaml
+    apiVersion: feast.dev/v1
+    kind: FeatureStore
+    metadata:
+      name: my-feast
+    spec:
+      feastProject: my_project
+    ```
+
+    ```bash
+    kubectl apply -f featurestore.yaml
+    ```
+  </Step>
+
+  <Step title="Verify the deployment">
+    Check that the `FeatureStore` reached the `Ready` state:
+
+    ```bash
+    kubectl get feast
+    ```
+
+    ```
+    NAME       STATUS   AGE
+    my-feast   Ready    2m21s
+    ```
+  </Step>
+</Steps>
+
+### FeatureStore custom resource examples
+
+**Minimal deployment (default online store server):**
+
+```yaml
+apiVersion: feast.dev/v1
+kind: FeatureStore
+metadata:
+  name: sample
+spec:
+  feastProject: my_project
+```
+
+**All remote servers (online, offline, registry, and UI):**
+
+```yaml
+apiVersion: feast.dev/v1
+kind: FeatureStore
+metadata:
+  name: sample-remote-servers
+spec:
+  feastProject: my_project
+  services:
+    offlineStore:
+      server: {}
+    registry:
+      local:
+        server: {}
+    ui: {}
+```
+
+**S3 registry with object store persistence:**
+
+```yaml
+apiVersion: feast.dev/v1
+kind: FeatureStore
+metadata:
+  name: sample-s3-registry
+spec:
+  feastProject: my_project
+  services:
+    registry:
+      local:
+        persistence:
+          file:
+            path: s3://my-bucket/registry.db
+            cache_ttl_seconds: 60
+            cache_mode: sync
+            s3_additional_kwargs:
+              ServerSideEncryption: AES256
+              ACL: bucket-owner-full-control
+```
+
+**GCS registry with BigQuery offline store and Bigtable online store:**
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: feast-data-stores
+stringData:
+  bigtable: |
+    project_id: my_gcp_project
+    instance: my_bigtable_instance
+  bigquery: |
+    dataset: feast_bq_dataset
+---
+apiVersion: feast.dev/v1
+kind: FeatureStore
+metadata:
+  name: gcs
+spec:
+  feastProject: my_project
+  services:
+    offlineStore:
+      persistence:
+        store:
+          secretRef:
+            name: feast-data-stores
+          type: bigquery
+    onlineStore:
+      persistence:
+        store:
+          secretRef:
+            name: feast-data-stores
+          type: bigtable
+      server:
+        volumeMounts:
+          - mountPath: /opt/app-root/src/.config/gcloud
+            name: gcloud-creds
+            readOnly: true
+    registry:
+      local:
+        persistence:
+          file:
+            path: gs://my-gcs-bucket/registry.pb
+    volumes:
+      - name: gcloud-creds
+        secret:
+          secretName: gcloud-creds
+```
+
+**PostgreSQL-backed online store and SQL registry:**
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: feast-data-stores
+stringData:
+  sql: |
+    path: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres.svc.cluster.local:5432/${POSTGRES_DB}
+    cache_ttl_seconds: 60
+    sqlalchemy_config_kwargs:
+        echo: false
+        pool_pre_ping: true
+  postgres: |
+    host: postgres.svc.cluster.local
+    port: 5432
+    database: ${POSTGRES_DB}
+    db_schema: public
+    user: ${POSTGRES_USER}
+    password: ${POSTGRES_PASSWORD}
+---
+apiVersion: feast.dev/v1
+kind: FeatureStore
+metadata:
+  name: sample-db-persistence
+spec:
+  feastProject: my_project
+  services:
+    onlineStore:
+      persistence:
+        store:
+          type: postgres
+          secretRef:
+            name: feast-data-stores
+      server:
+        envFrom:
+          - secretRef:
+              name: postgres-secret
+    registry:
+      local:
+        persistence:
+          store:
+            type: sql
+            secretRef:
+              name: feast-data-stores
+```
+
+### Horizontal scaling and high availability
+
+The Feast Operator supports horizontal scaling via HPA autoscaling or static replicas. DB-backed persistence is required for all scaled services.
+
+<Info>
+  When scaling is enabled, the operator automatically injects soft pod anti-affinity rules and zone topology spread constraints to improve resilience across nodes and availability zones.
+</Info>
+
+**HPA autoscaling example (2–10 replicas):**
+
+```yaml
+apiVersion: feast.dev/v1
+kind: FeatureStore
+metadata:
+  name: sample-scaling-hpa
+spec:
+  feastProject: my_project
+  services:
+    scaling:
+      autoscaling:
+        minReplicas: 2
+        maxReplicas: 10
+        metrics:
+          - type: Resource
+            resource:
+              name: cpu
+              target:
+                type: Utilization
+                averageUtilization: 70
+    podDisruptionBudgets:
+      maxUnavailable: 1
+    onlineStore:
+      persistence:
+        store:
+          type: postgres
+          secretRef:
+            name: feast-data-stores
+      server:
+        resources:
+          requests:
+            cpu: 200m
+            memory: 256Mi
+          limits:
+            cpu: "1"
+            memory: 1Gi
+    registry:
+      local:
+        persistence:
+          store:
+            type: sql
+            secretRef:
+              name: feast-data-stores
+```
+
+### Upgrading the Operator
+
+**OLM-managed installations:** Upgrades are handled automatically by OLM — no manual steps required.
+
+**kubectl-managed installations:** Re-run the install command:
+
+```bash
+kubectl apply --server-side --force-conflicts \
+  -f https://raw.githubusercontent.com/feast-dev/feast/refs/heads/stable/infra/feast-operator/dist/install.yaml
+```
+
+<Warning>
+  **Upgrading from versions before 0.61.0** requires a one-time manual step. Version 0.61.0 changed the operator Deployment's `spec.selector` (an immutable field). Delete the existing Deployment before applying:
+
+  ```bash
+  kubectl delete deployment feast-operator-controller-manager \
+    -n feast-operator-system --ignore-not-found=true
+
+  kubectl apply --server-side --force-conflicts \
+    -f https://raw.githubusercontent.com/feast-dev/feast/refs/heads/stable/infra/feast-operator/dist/install.yaml
+  ```
+
+  Existing `FeatureStore` CRs and their workloads are not affected — the new operator pod reconciles them automatically on startup.
+</Warning>
+
+---
+
+## Helm Chart
+
+The `feast-feature-server` Helm chart deploys individual Feast server components. It supports `online` (default), `offline`, `ui`, and `registry` deployment modes.
+
+### Add the Feast Helm repository
+
+```bash
+helm repo add feast-charts https://feast-helm-charts.storage.googleapis.com
+helm repo update
+```
+
+### Install the feature server
+
+The chart requires a base64-encoded `feature_store.yaml`. Encode your config file and pass it as a value:
+
+<CodeGroup>
+```bash Online server (default)
+helm install feast-feature-server feast-charts/feast-feature-server \
+  --set feature_store_yaml_base64=$(base64 < feature_store.yaml)
+```
+
+```bash Offline server
+helm install feast-offline-server feast-charts/feast-feature-server \
+  --set feast_mode=offline \
+  --set feature_store_yaml_base64=$(base64 < feature_store.yaml)
+```
+
+```bash UI server
+helm install feast-ui-server feast-charts/feast-feature-server \
+  --set feast_mode=ui \
+  --set feature_store_yaml_base64=$(base64 < feature_store.yaml)
+```
+
+```bash Registry server
+helm install feast-registry-server feast-charts/feast-feature-server \
+  --set feast_mode=registry \
+  --set feature_store_yaml_base64=$(base64 < feature_store.yaml)
+```
+</CodeGroup>
+
+### Helm values reference
+
+| Value | Type | Default | Description |
+|---|---|---|---|
+| `feature_store_yaml_base64` | string | `""` | **Required.** Base64-encoded `feature_store.yaml` |
+| `feast_mode` | string | `"online"` | Deployment mode: `online`, `offline`, `ui`, or `registry` |
+| `image.repository` | string | `quay.io/feastdev/feature-server` | Docker image repository |
+| `image.tag` | string | `0.61.0` | Docker image tag |
+| `replicaCount` | int | `1` | Number of pod replicas |
+| `service.type` | string | `ClusterIP` | Kubernetes service type |
+| `service.port` | int | `80` | Service port |
+| `metrics.enabled` | bool | `false` | Enable OpenTelemetry metrics |
+| `logLevel` | string | `WARNING` | Log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| `resources` | object | `{}` | CPU/memory resource requests and limits |
+| `commandArgs` | list | `[]` | Override default container command arguments |
+
+### Custom values.yaml
+
+```yaml
+# values.yaml
+replicaCount: 2
+
+image:
+  repository: quay.io/feastdev/feature-server
+  tag: 0.61.0
+  pullPolicy: IfNotPresent
+
+feast_mode: online
+
+service:
+  type: ClusterIP
+  port: 80
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+livenessProbe:
+  initialDelaySeconds: 30
+  periodSeconds: 30
+
+readinessProbe:
+  initialDelaySeconds: 20
+  periodSeconds: 10
+
+metrics:
+  enabled: false
+```
+
+```bash
+helm install feast-feature-server feast-charts/feast-feature-server \
+  --values values.yaml \
+  --set feature_store_yaml_base64=$(base64 < feature_store.yaml)
+```
+
+### Port reference
+
+| Mode | Container port |
+|---|---|
+| `online` | `6566` |
+| `offline` | `8815` |
+| `ui` | `8888` |
+| `registry` | `6570` |
+
+---
+
+## TLS configuration
+
+Feast supports TLS/SSL for all server components. In production, obtain certificates from a trusted certificate authority. For development, generate a self-signed certificate:
+
+```bash
+openssl req -x509 -newkey rsa:2048 \
+  -keyout key.pem -out cert.pem \
+  -days 365 -nodes
+```
+
+### Starting servers in TLS mode
+
+<CodeGroup>
+```bash Online feature server
+feast serve --key /path/to/key.pem --cert /path/to/cert.pem
+```
+
+```bash Registry server
+feast serve_registry --key /path/to/key.pem --cert /path/to/cert.pem
+```
+
+```bash Offline server
+feast serve_offline --key /path/to/key.pem --cert /path/to/cert.pem
+```
+</CodeGroup>
+
+### Client configuration for TLS servers
+
+Configure the Feast client to connect to TLS-enabled remote servers using the `cert` field:
+
+```yaml
+# feature_store.yaml (client connecting to TLS servers)
+project: feast-project
+provider: local
+
+registry:
+  registry_type: remote
+  path: https://localhost:6570
+  cert: /path/to/cert.pem
+
+online_store:
+  type: remote
+  path: http://localhost:6566
+  cert: /path/to/cert.pem
+
+offline_store:
+  type: remote
+  host: localhost
+  port: 8815
+  scheme: https
+  cert: /path/to/cert.pem
+
+auth:
+  type: no_auth
+```
+
+<Tip>
+  Instead of passing `cert` individually to each component, add the public certificate to your system's CA trust store and set the `FEAST_CA_CERT_FILE_PATH` environment variable. Feast will use it automatically for all TLS connections.
+</Tip>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Feature Server" icon="server" href="/deployment/feature-server">
+    REST API endpoints, authentication, Docker deployment, and Prometheus metrics
+  </Card>
+  <Card title="Cloud Providers" icon="cloud" href="/deployment/cloud-providers">
+    AWS, GCP, and Azure-specific feature_store.yaml configurations
+  </Card>
+</CardGroup>

@@ -1,0 +1,318 @@
+---
+title: "Architecture"
+description: "How Feast components fit together — from raw data sources to low-latency feature serving."
+---
+
+Feast is designed around a clear separation between **offline** (historical, batch) and **online** (low-latency, real-time) data paths. A central registry stores all feature definitions, and a provider ties the components together for a given deployment environment.
+
+## Component overview
+
+<CardGroup cols={2}>
+  <Card title="Offline Store" icon="database" href="/concepts/offline-online-stores">
+    Stores and computes historical time-series feature values. Used for building training datasets and for materializing features into the online store. Backed by data warehouses and query engines such as BigQuery, Snowflake, Redshift, DuckDB, and Parquet/Dask.
+  </Card>
+  <Card title="Online Store" icon="bolt" href="/concepts/offline-online-stores">
+    A low-latency key-value store that holds the latest feature value for each entity. Queried at inference time via the Python SDK or the Feature Server. Supported backends include Redis, DynamoDB, Bigtable, SQLite, and Snowflake.
+  </Card>
+  <Card title="Registry" icon="book" href="/reference/feature-store-yaml">
+    The central catalog of all Feast objects — entities, feature views, feature services, and data sources. Updated by `feast apply`. Clients read the registry to resolve feature references at retrieval time. Available in file-based and SQL-backed variants.
+  </Card>
+  <Card title="Feature Server" icon="server" href="/deployment/feature-server">
+    An optional FastAPI-based HTTP service that wraps the online store and registry. Exposes REST endpoints for feature retrieval and push ingestion, enabling non-Python clients and horizontal scaling without embedding the SDK into every application.
+  </Card>
+</CardGroup>
+
+<CardGroup cols={2}>
+  <Card title="Provider" icon="plug" href="/reference/feature-store-yaml">
+    Coordinates the offline store, online store, and infrastructure for a given environment. Built-in providers: `local`, `gcp`, and `aws`. Custom providers can be implemented for other environments.
+  </Card>
+  <Card title="Python SDK & CLI" icon="terminal" href="/reference/cli">
+    The primary interface for data scientists and engineers. The CLI handles `feast apply`, `feast materialize`, `feast ui`, and more. The `FeatureStore` class exposes the full programmatic API for retrieval and ingestion.
+  </Card>
+</CardGroup>
+
+## Data flow
+
+The diagram below shows how data moves through Feast, from raw sources to model inference.
+
+```
+Data Sources (Parquet, BigQuery, Snowflake, Kafka, Kinesis, …)
+        │
+        │  feast apply — registers definitions in the Registry
+        ▼
+  ┌─────────────────────────────────────────┐
+  │             Registry                    │
+  │  (entities, feature views, services)    │
+  └─────────────────────────────────────────┘
+        │
+        │  get_historical_features()
+        ▼
+  ┌─────────────────────────────────────────┐
+  │           Offline Store                 │
+  │  (BigQuery / Snowflake / DuckDB / …)    │──▶ Training datasets
+  └─────────────────────────────────────────┘         │
+        │                                             │
+        │  materialize / materialize-incremental       │ batch scoring
+        │  push() — streaming ingestion               │
+        ▼                                             ▼
+  ┌─────────────────────────────────────────┐   Model Training /
+  │           Online Store                  │   Batch Inference
+  │  (Redis / DynamoDB / SQLite / …)        │
+  └─────────────────────────────────────────┘
+        │
+        │  get_online_features()   /get-online-features (HTTP)
+        ▼
+  Real-Time Inference (model server, application)
+```
+
+## Core concepts
+
+### Registry
+
+The registry is the source of truth for all Feast metadata. It is a file or SQL database that stores the protobuf representation of every Feast object applied with `feast apply` or `FeatureStore.apply()`.
+
+Clients instantiate a `FeatureStore` pointing at the registry path. The registry is read at retrieval time to resolve feature references to the correct data source and schema.
+
+```python
+from feast import FeatureStore
+
+# Reads feature_store.yaml from the current directory,
+# which includes the registry path.
+store = FeatureStore(repo_path=".")
+```
+
+For multi-environment setups, teams typically maintain separate registries for dev, staging, and production, with production registries under locked-down write access.
+
+### Offline store
+
+The offline store is the compute and storage layer for historical feature data. It implements the `OfflineStore` interface and is responsible for:
+
+- Executing point-in-time joins when `get_historical_features()` is called.
+- Reading from the configured data sources (e.g., Parquet files, BigQuery tables).
+- Providing the data pipeline for materialization into the online store.
+
+Only one offline store can be active at a time, and it must be compatible with the configured data sources.
+
+```python
+training_df = store.get_historical_features(
+    entity_df=entity_df,      # entity keys + event timestamps
+    features=[
+        "driver_hourly_stats:conv_rate",
+        "driver_hourly_stats:acc_rate",
+        "driver_hourly_stats:avg_daily_trips",
+    ],
+).to_df()
+```
+
+### Online store
+
+The online store is a low-latency key-value store that holds **only the latest feature value** for each entity key. No historical values are stored. Features are loaded into the online store through materialization or pushed directly via the Push API.
+
+```python
+feature_vector = store.get_online_features(
+    features=[
+        "driver_hourly_stats:conv_rate",
+        "driver_hourly_stats:acc_rate",
+        "driver_hourly_stats:avg_daily_trips",
+    ],
+    entity_rows=[{"driver_id": 1001}],
+).to_dict()
+```
+
+### Materialization
+
+Materialization is the process of reading feature values from the offline store and writing the latest values to the online store. It is triggered by `feast materialize` or `feast materialize-incremental`. Incremental materialization only processes new data since the last run, bounded by the `ttl` set on each `FeatureView`.
+
+```bash
+# Materialize all new data up to the current timestamp
+CURRENT_TIME=$(date -u +"%Y-%m-%dT%H:%M:%S")
+feast materialize-incremental $CURRENT_TIME
+```
+
+### Feature Server
+
+The Feature Server is an optional FastAPI REST service that wraps the Python SDK. It enables non-Python clients and supports horizontal scaling independent of application deployments.
+
+| Endpoint | Description |
+|---|---|
+| `POST /get-online-features` | Retrieve feature values for a set of entity rows |
+| `POST /push` | Push feature data to the online and/or offline store |
+| `POST /materialize` | Materialize features within a time range |
+| `POST /materialize-incremental` | Incrementally materialize to the current timestamp |
+
+Start the Feature Server with:
+
+```bash
+feast serve
+```
+
+### Provider
+
+A provider bundles the offline store, online store, and any cloud-specific infrastructure into a named configuration. Feast ships with three built-in providers:
+
+| Provider | Default offline store | Default online store |
+|---|---|---|
+| `local` | File / Dask (Parquet) | SQLite |
+| `gcp` | BigQuery | Google Cloud Datastore |
+| `aws` | Redshift | DynamoDB |
+
+Providers are set in `feature_store.yaml`:
+
+```yaml
+project: my_project
+provider: local
+registry: data/registry.db
+online_store:
+  type: sqlite
+  path: data/online_store.db
+```
+
+Default online and offline stores can be overridden independently. For example, you can use the `gcp` provider with Redis as the online store instead of Datastore.
+
+## Point-in-time correctness
+
+Point-in-time correctness is one of Feast's core guarantees for training data generation. When you call `get_historical_features()`, Feast performs a point-in-time join:
+
+- For each row in the entity dataframe, it retrieves the feature values that were valid **at or before** the row's `event_timestamp`.
+- Feature values observed **after** a row's timestamp are never included in that row's result.
+- This prevents data leakage — the model cannot see future information during training.
+
+```python
+entity_df = pd.DataFrame({
+    "driver_id": [1001, 1002, 1003],
+    # Each timestamp is the upper bound for the join.
+    # Feast retrieves the latest feature values at or before this time.
+    "event_timestamp": [
+        datetime(2021, 4, 12, 10, 59, 42),
+        datetime(2021, 4, 12, 8, 12, 10),
+        datetime(2021, 4, 12, 16, 40, 26),
+    ],
+})
+```
+
+The `ttl` field on a `FeatureView` sets a maximum staleness window. If the most recent feature value for an entity is older than `ttl`, it is excluded from the result to prevent stale data from appearing valid.
+
+## Push vs pull model
+
+Feast uses a **push model** for online feature ingestion. Data producers push feature values to Feast (via materialization or the Push API), and Feast stores them in the online store. At inference time, clients read pre-stored values with a simple key lookup.
+
+This contrasts with a pull model, where Feast would fetch data from sources at request time. The push model makes Feast read-optimized for low-latency retrieval, at the cost of requiring data producers to keep the online store up to date.
+
+<Tabs>
+  <Tab title="Batch push (materialization)">
+    ```bash
+    # Triggered on a schedule — suitable for features updated infrequently
+    feast materialize-incremental $(date -u +"%Y-%m-%dT%H:%M:%S")
+    ```
+  </Tab>
+  <Tab title="Streaming push (Push API)">
+    ```python
+    import pandas as pd
+    from feast import FeatureStore
+
+    store = FeatureStore(repo_path=".")
+
+    # Push a single event to the online store immediately
+    store.push(
+        push_source_name="driver_stats_push_source",
+        df=pd.DataFrame({
+            "driver_id": [1001],
+            "conv_rate": [0.92],
+            "acc_rate": [0.87],
+            "avg_daily_trips": [712],
+            "event_timestamp": [pd.Timestamp.utcnow()],
+        }),
+    )
+    ```
+  </Tab>
+</Tabs>
+
+## Feature transformations
+
+Feast supports three types of feature transformations:
+
+<AccordionGroup>
+  <Accordion title="On-demand feature views">
+    Transformations defined as Python functions that run at retrieval time, applied to features from other views and request-time data. They execute inside the Feast feature server or SDK — no separate compute engine required.
+
+    ```python
+    from feast.on_demand_feature_view import on_demand_feature_view
+    from feast.types import Float64
+
+    @on_demand_feature_view(
+        sources=[driver_stats_fv, input_request],
+        schema=[Field(name="conv_rate_plus_val1", dtype=Float64)],
+    )
+    def transformed_conv_rate(inputs: pd.DataFrame) -> pd.DataFrame:
+        df = pd.DataFrame()
+        df["conv_rate_plus_val1"] = inputs["conv_rate"] + inputs["val_to_add"]
+        return df
+    ```
+  </Accordion>
+  <Accordion title="Batch transformations">
+    Transformations executed by the offline store or a compute engine (e.g., Spark, DuckDB) during materialization. Suitable for large-scale aggregations and feature engineering over historical data.
+
+    ```python
+    from feast import Aggregation, FeatureView
+
+    feature_view = FeatureView(
+        name="driver_stats_agg",
+        aggregations=[
+            Aggregation(column="amount", function="sum"),
+            Aggregation(column="amount", function="avg", time_window="1h"),
+        ],
+        ...
+    )
+    ```
+  </Accordion>
+  <Accordion title="Streaming transformations">
+    Transformations applied to streaming data sources (Kafka, Kinesis) before values are written to the online store. Feast delegates the compute to your streaming engine; the results are pushed via the Push API.
+  </Accordion>
+</AccordionGroup>
+
+## SDK, CLI, and feature server interaction
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                       Developer Tools                            │
+│                                                                  │
+│   feast apply       feast materialize       feast ui             │
+│   feast serve       feast teardown                               │
+│       │                   │                     │                │
+│       └───────────────────┴─────────────────────┘                │
+│                           │                                      │
+│                   Python SDK (FeatureStore)                      │
+│         apply()  get_historical_features()  materialize()        │
+│         get_online_features()  push()  write_to_online_store()   │
+└───────────────────────────┬──────────────────────────────────────┘
+                            │
+          ┌─────────────────┼──────────────────┐
+          ▼                 ▼                  ▼
+      Registry         Offline Store      Online Store
+   (file / SQL)    (BigQuery / DuckDB)  (Redis / SQLite)
+                                             ▲
+                                             │
+                                    Feature Server
+                                  (FastAPI REST API)
+                                  /get-online-features
+                                  /push
+```
+
+The **CLI** is a thin wrapper around the Python SDK. Every CLI command maps to a `FeatureStore` method. The **Feature Server** is an optional HTTP layer on top of the online store — it does not replace the SDK for training workflows, but it provides a language-agnostic interface for online serving.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Walk through a complete local example with training data generation and online serving.
+  </Card>
+  <Card title="Offline and online stores" icon="database" href="/concepts/offline-online-stores">
+    See all supported store backends and how to configure them.
+  </Card>
+  <Card title="Feature retrieval" icon="magnifying-glass" href="/concepts/feature-retrieval">
+    Understand the full retrieval API — historical features, online features, and feature services.
+  </Card>
+  <Card title="Running in production" icon="gears" href="/guides/running-in-production">
+    Deploy Feast with a CI/CD pipeline, SQL registry, and scheduled materialization.
+  </Card>
+</CardGroup>

@@ -1,0 +1,222 @@
+---
+title: "Offline feature server"
+description: "Serve historical feature retrieval over Apache Arrow Flight so that non-Python clients (Java, Go, and others) can access offline store data without a local Feast SDK."
+---
+
+The offline feature server is an [Apache Arrow Flight](https://arrow.apache.org/docs/format/Flight.html) server that exposes offline store operations over gRPC. It wraps the existing offline store implementations and makes them accessible to any language with an Arrow Flight client — including Java, Go, Rust, and others.
+
+Use the offline feature server when:
+
+- You need to generate training datasets or run batch scoring from a non-Python application.
+- You want a centralized service to control access to historical features.
+- You are operating a multi-language platform and need a language-agnostic offline store interface.
+
+---
+
+## Starting the server
+
+Run `feast serve_offline` from inside your feature repository directory.
+
+```bash
+feast serve_offline
+```
+
+The server listens on port `8815` by default using the gRPC (Arrow Flight) protocol.
+
+### CLI options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--host` | `127.0.0.1` | Bind address |
+| `--port` | `8815` | Listening port |
+| `--key` | — | Path to TLS private key (`key.pem`) |
+| `--cert` | — | Path to TLS certificate (`cert.pem`) |
+
+### Quick-start example
+
+<Steps>
+  <Step title="Initialize and apply the feature repo">
+    ```bash
+    feast init feature_repo
+    cd feature_repo
+    feast apply
+    ```
+  </Step>
+  <Step title="Start the offline server">
+    ```bash
+    feast serve_offline
+    ```
+
+    You should see output similar to:
+
+    ```
+    feast.offline_server INFO: Offline store server serving at: grpc://127.0.0.1:8815
+    feast.offline_server INFO: offline server starting with pid: [12345]
+    ```
+  </Step>
+  <Step title="Configure a client to use the remote offline store">
+    Add a remote offline store configuration to your client's `feature_store.yaml`:
+
+    ```yaml
+    offline_store:
+      type: remote
+      host: localhost
+      port: 8815
+    ```
+
+    See the [offline stores reference](/reference/offline-stores) for all client options.
+  </Step>
+</Steps>
+
+---
+
+## Protocol: Apache Arrow Flight
+
+The offline feature server uses the [Apache Arrow Flight](https://arrow.apache.org/docs/format/Flight.html) RPC protocol. Data is transferred as Arrow record batches over gRPC, which provides:
+
+- **Efficient columnar transport** — Zero-copy serialization for large feature datasets.
+- **Language interoperability** — Clients exist for Python, Java, Go, Rust, C++, and more.
+- **Streaming support** — Large result sets are streamed incrementally rather than loaded into memory all at once.
+
+The server exposes offline store operations as Arrow Flight endpoints. Each operation corresponds to a specific Flight action or data stream.
+
+---
+
+## Retrieving historical features
+
+From a Python client configured with the remote offline store, the API is identical to the local offline store:
+
+```python
+from feast import FeatureStore
+from datetime import datetime
+import pandas as pd
+
+store = FeatureStore(repo_path=".")
+
+entity_df = pd.DataFrame({
+    "driver_id": [1001, 1002, 1003],
+    "event_timestamp": [
+        datetime(2021, 12, 31),
+        datetime(2021, 12, 31),
+        datetime(2021, 12, 31),
+    ],
+})
+
+training_df = store.get_historical_features(
+    entity_df=entity_df,
+    features=[
+        "driver_hourly_stats:conv_rate",
+        "driver_hourly_stats:acc_rate",
+        "driver_hourly_stats:avg_daily_trips",
+    ],
+).to_df()
+
+print(training_df.head())
+```
+
+The call is transparently routed to the offline server via Arrow Flight. The result is returned as a pandas DataFrame (or PyArrow table via `.to_arrow()`).
+
+---
+
+## Supported operations
+
+The offline feature server supports the same set of operations as the local offline store SDK. All operations are available over the Arrow Flight interface.
+
+| Flight endpoint | Description |
+|---|---|
+| `get_historical_features` | Retrieve historical features with point-in-time correctness |
+| `pull_latest_from_table_or_query` | Pull the most recent row per entity from a data source |
+| `pull_all_from_table_or_query` | Pull all rows from a data source or query |
+| `offline_write_batch` | Write a batch of data to the offline store |
+| `write_logged_features` | Write logged online serving features to the offline store |
+| `persist` | Persist the result of a read operation back to the offline store |
+
+---
+
+## Permissions and access control
+
+| Endpoint | Resource type | Required permission |
+|---|---|---|
+| `get_historical_features` | `FeatureView` | Read Offline |
+| `pull_all_from_table_or_query` | `DataSource` | Read Offline |
+| `pull_latest_from_table_or_query` | `DataSource` | Read Offline |
+| `offline_write_batch` | `FeatureView` | Write Offline |
+| `write_logged_features` | `FeatureService` | Write Offline |
+| `persist` | `DataSource` | Write Offline |
+
+See the [authorization guide](/guides/authorization) for configuration instructions.
+
+---
+
+## TLS/SSL
+
+Enabling TLS encrypts Arrow Flight traffic between clients and the offline server.
+
+<Steps>
+  <Step title="Generate a self-signed certificate (development only)">
+    ```bash
+    openssl req -x509 -newkey rsa:2048 \
+      -keyout key.pem -out cert.pem \
+      -days 365 -nodes
+    ```
+
+    <Warning>
+      Self-signed certificates are for development only. Use a certificate from a
+      trusted CA in production.
+    </Warning>
+  </Step>
+  <Step title="Start the offline server with TLS">
+    ```bash
+    feast serve_offline --key /path/to/key.pem --cert /path/to/cert.pem
+    ```
+
+    The server address changes to `grpc+tls://`:
+
+    ```
+    feast.offline_server INFO: Offline store server serving at: grpc+tls://127.0.0.1:8815
+    ```
+  </Step>
+  <Step title="Configure the client for TLS">
+    ```yaml
+    # feature_store.yaml (client)
+    offline_store:
+      type: remote
+      host: localhost
+      port: 8815
+      scheme: https
+      cert: /path/to/cert.pem
+    ```
+
+    Set `scheme: https` explicitly — the default is `http`. The `cert` field is optional if the certificate is already trusted by the system CA store.
+  </Step>
+</Steps>
+
+---
+
+## Deploying on Kubernetes
+
+The offline feature server can be deployed using the Feast Operator by adding `offlineStore.server: {}` to your `FeatureStore` custom resource:
+
+```yaml
+apiVersion: feast.dev/v1
+kind: FeatureStore
+metadata:
+  name: sample-offline-server
+spec:
+  feastProject: my_project
+  services:
+    offlineStore:
+      server: {}
+```
+
+For more advanced CR configurations, see the [feast-operator samples directory](https://github.com/feast-dev/feast/tree/main/infra/feast-operator/config/samples).
+
+See the [Kubernetes deployment guide](/deployment/kubernetes) for a full Kubernetes walkthrough.
+
+---
+
+## Complete example
+
+A runnable end-to-end example is available in the Feast repository:
+
+- [`examples/remote-offline-store`](https://github.com/feast-dev/feast/tree/main/examples/remote-offline-store)

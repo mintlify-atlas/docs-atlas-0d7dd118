@@ -1,80 +1,420 @@
 ---
 title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+description: "Deploy a local feature store and serve your first features in under ten minutes."
 ---
 
-## Get started in three steps
+This guide walks you through a complete Feast workflow using a local setup: Parquet files as the offline store and SQLite as the online store. By the end you will have generated a training dataset, materialized features to the online store, and retrieved them for real-time inference.
 
-Get your documentation site running locally and make your first customization.
+<Note>
+  For production deployments on AWS, GCP, or Snowflake, see the [cloud providers guide](/deployment/cloud-providers) after completing this tutorial.
+</Note>
 
-### Step 1: Set up your local environment
+## What you will build
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+A feature store for a ride-sharing driver satisfaction model. The store holds hourly driver statistics — conversion rate, acceptance rate, and average daily trips — that power both model training and real-time inference.
 
-### Step 2: Deploy your changes
+<Steps>
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+<Step title="Install Feast">
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+Create a virtual environment, then install the Feast SDK and CLI:
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+```bash
+python -m venv venv/
+source venv/bin/activate
+pip install feast
+```
 
-### Step 3: Go live
+Verify the installation:
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+```bash
+feast version
+```
+
+</Step>
+
+<Step title="Create a feature repository">
+
+Bootstrap a new feature repository with `feast init`. This generates a working example project with sample data, feature definitions, and a configuration file.
+
+```bash
+feast init my_project
+cd my_project/feature_repo
+```
+
+The generated repository contains:
+
+```
+my_project/
+└── feature_repo/
+    ├── data/
+    │   └── driver_stats.parquet   # Sample driver statistics data
+    ├── feature_definitions.py     # Feature views, entities, and services
+    ├── feature_store.yaml         # Store configuration
+    └── test_workflow.py           # End-to-end workflow script
+```
+
+<CodeGroup>
+
+```yaml feature_store.yaml
+project: my_project
+# File-based registry stores feature definitions locally.
+# For production, switch to a SQL-backed registry.
+registry: data/registry.db
+# The provider sets default offline and online stores.
+# local = file/Dask offline store + SQLite online store
+provider: local
+online_store:
+  type: sqlite
+  path: data/online_store.db
+entity_key_serialization_version: 3
+```
+
+```python feature_definitions.py
+from datetime import timedelta
+
+import pandas as pd
+
+from feast import (
+    Entity,
+    FeatureService,
+    FeatureView,
+    Field,
+    FileSource,
+    Project,
+    PushSource,
+    RequestSource,
+)
+from feast.on_demand_feature_view import on_demand_feature_view
+from feast.types import Float32, Float64, Int64
+
+# Define a project for the feature repo
+project = Project(name="my_project", description="A project for driver statistics")
+
+# An entity is the primary key used to look up features — here, a driver.
+driver = Entity(name="driver", join_keys=["driver_id"])
+
+# Read raw feature data from a local Parquet file.
+driver_stats_source = FileSource(
+    name="driver_hourly_stats_source",
+    path="data/driver_stats.parquet",
+    timestamp_field="event_timestamp",
+    created_timestamp_column="created",
+)
+
+# A FeatureView defines the schema and source for a set of features.
+driver_stats_fv = FeatureView(
+    name="driver_hourly_stats",
+    entities=[driver],
+    ttl=timedelta(days=1),
+    schema=[
+        Field(name="conv_rate", dtype=Float32),
+        Field(name="acc_rate", dtype=Float32),
+        Field(name="avg_daily_trips", dtype=Int64, description="Average daily trips"),
+    ],
+    online=True,
+    source=driver_stats_source,
+    tags={"team": "driver_performance"},
+)
+
+# A RequestSource holds features available only at request time.
+input_request = RequestSource(
+    name="vals_to_add",
+    schema=[
+        Field(name="val_to_add", dtype=Int64),
+        Field(name="val_to_add_2", dtype=Int64),
+    ],
+)
+
+# An on-demand feature view computes derived features at retrieval time.
+@on_demand_feature_view(
+    sources=[driver_stats_fv, input_request],
+    schema=[
+        Field(name="conv_rate_plus_val1", dtype=Float64),
+        Field(name="conv_rate_plus_val2", dtype=Float64),
+    ],
+)
+def transformed_conv_rate(inputs: pd.DataFrame) -> pd.DataFrame:
+    df = pd.DataFrame()
+    df["conv_rate_plus_val1"] = inputs["conv_rate"] + inputs["val_to_add"]
+    df["conv_rate_plus_val2"] = inputs["conv_rate"] + inputs["val_to_add_2"]
+    return df
+
+# A FeatureService groups features into a versioned, named set for a model.
+driver_activity_v1 = FeatureService(
+    name="driver_activity_v1",
+    features=[
+        driver_stats_fv[["conv_rate"]],  # Sub-selects a single feature
+        transformed_conv_rate,
+    ],
+)
+
+# A PushSource allows streaming data to be written directly to the online store.
+driver_stats_push_source = PushSource(
+    name="driver_stats_push_source",
+    batch_source=driver_stats_source,
+)
+```
+
+</CodeGroup>
+
+The `provider` field in `feature_store.yaml` determines the default offline and online stores. Valid values are `local`, `gcp`, and `aws`. Third-party community plugins add support for Spark, Azure, Hive, Trino, PostgreSQL, and more.
+
+</Step>
+
+<Step title="Inspect the raw data">
+
+The sample dataset contains hourly driver statistics. Take a look before applying your definitions:
+
+```python
+import pandas as pd
+
+df = pd.read_parquet("data/driver_stats.parquet")
+print(df.head())
+```
+
+```
+   driver_id           event_timestamp  conv_rate  acc_rate  avg_daily_trips
+0       1001 2021-04-12 08:00:00+00:00   0.800648  0.265174              643
+1       1002 2021-04-12 08:00:00+00:00   0.644141  0.996602              765
+2       1003 2021-04-12 08:00:00+00:00   0.855432  0.546345              954
+```
+
+</Step>
+
+<Step title="Register feature definitions">
+
+`feast apply` scans the current directory for Python files, registers all feature objects (entities, feature views, feature services), and provisions the configured infrastructure — in this case, SQLite tables in the online store.
+
+```bash
+feast apply
+```
+
+```
+Created entity driver
+Created feature view driver_hourly_stats
+Created feature view driver_hourly_stats_fresh
+Created on demand feature view transformed_conv_rate
+Created on demand feature view transformed_conv_rate_fresh
+Created feature service driver_activity_v3
+Created feature service driver_activity_v1
+Created feature service driver_activity_v2
+
+Created sqlite table my_project_driver_hourly_stats_fresh
+Created sqlite table my_project_driver_hourly_stats
+```
+
+</Step>
+
+<Step title="Generate a training dataset">
+
+Use `store.get_historical_features()` to build a training dataset. You supply an entity dataframe that maps entity values to timestamps. Feast performs a point-in-time join: for each row it retrieves the feature values that were valid at or before the given timestamp, ensuring no future data leaks into your training set.
+
+```python
+from datetime import datetime
+
+import pandas as pd
+from feast import FeatureStore
+
+entity_df = pd.DataFrame.from_dict(
+    {
+        # Entity join key and values
+        "driver_id": [1001, 1002, 1003],
+        # event_timestamp is reserved — Feast uses it as the upper bound
+        # for the point-in-time join. No feature value observed after this
+        # timestamp will appear in the resulting row.
+        "event_timestamp": [
+            datetime(2021, 4, 12, 10, 59, 42),
+            datetime(2021, 4, 12, 8, 12, 10),
+            datetime(2021, 4, 12, 16, 40, 26),
+        ],
+        # Labels are passed through unchanged — Feast does not process them
+        "label_driver_reported_satisfaction": [1, 5, 3],
+        # Request-time values used by the on-demand feature view
+        "val_to_add": [1, 2, 3],
+        "val_to_add_2": [10, 20, 30],
+    }
+)
+
+store = FeatureStore(repo_path=".")
+
+training_df = store.get_historical_features(
+    entity_df=entity_df,
+    features=[
+        "driver_hourly_stats:conv_rate",
+        "driver_hourly_stats:acc_rate",
+        "driver_hourly_stats:avg_daily_trips",
+        "transformed_conv_rate:conv_rate_plus_val1",
+        "transformed_conv_rate:conv_rate_plus_val2",
+    ],
+).to_df()
+
+print(training_df.head())
+```
+
+```
+   driver_id           event_timestamp  label_driver_reported_satisfaction  \
+0       1001 2021-04-12 10:59:42+00:00                                   1
+1       1002 2021-04-12 08:12:10+00:00                                   5
+2       1003 2021-04-12 16:40:26+00:00                                   3
+
+   val_to_add  val_to_add_2  conv_rate  acc_rate  avg_daily_trips  \
+0           1            10   0.800648  0.265174              643
+1           2            20   0.644141  0.996602              765
+2           3            30   0.855432  0.546345              954
+
+   conv_rate_plus_val1  conv_rate_plus_val2
+0             1.800648            10.800648
+1             2.644141            20.644141
+2             3.855432            30.855432
+```
+
+<Tip>
+  For batch scoring, set `entity_df["event_timestamp"] = pd.to_datetime("now", utc=True)` before calling `get_historical_features()`. This retrieves the most recent feature values for each entity.
+</Tip>
+
+</Step>
+
+<Step title="Materialize features to the online store">
+
+Materialization copies the latest feature values from the offline store into the online store so they can be retrieved with low latency at inference time.
+
+`feast materialize-incremental` transfers all new data since the last materialization run up to the given timestamp. The `ttl` set on each `FeatureView` determines the lookback window.
+
+<Tabs>
+  <Tab title="CLI (incremental)">
+    ```bash
+    CURRENT_TIME=$(date -u +"%Y-%m-%dT%H:%M:%S")
+    feast materialize-incremental $CURRENT_TIME
+    ```
+  </Tab>
+  <Tab title="CLI (all data)">
+    ```bash
+    # Materialize all data ignoring event timestamps
+    feast materialize --disable-event-timestamp
+    ```
+  </Tab>
+  <Tab title="Python SDK">
+    ```python
+    from datetime import datetime
+    from feast import FeatureStore
+
+    store = FeatureStore(repo_path=".")
+    store.materialize_incremental(end_date=datetime.utcnow())
+    ```
+  </Tab>
+</Tabs>
+
+```
+Materializing 2 feature views to 2024-04-19 10:59:58-04:00 into the sqlite online store.
+
+driver_hourly_stats from 2024-04-18 15:00:46-04:00 to 2024-04-19 10:59:58-04:00:
+100%|████████████████████████████████| 5/5 [00:00<00:00, 370.32it/s]
+driver_hourly_stats_fresh from 2024-04-18 15:00:46-04:00 to 2024-04-19 10:59:58-04:00:
+100%|████████████████████████████████| 5/5 [00:00<00:00, 1046.64it/s]
+```
+
+<Note>
+  The online store keeps only the **latest** feature value per entity key. No historical values are stored there — use `get_historical_features()` for time-travel queries.
+</Note>
+
+</Step>
+
+<Step title="Retrieve online features for inference">
+
+At inference time, use `store.get_online_features()` to fetch the latest materialized values with low latency. Results are returned as an `OnlineResponse` object that can be converted to a dict or DataFrame.
+
+<CodeGroup>
+
+```python Using feature references
+from pprint import pprint
+from feast import FeatureStore
+
+store = FeatureStore(repo_path=".")
+
+feature_vector = store.get_online_features(
+    features=[
+        "driver_hourly_stats:conv_rate",
+        "driver_hourly_stats:acc_rate",
+        "driver_hourly_stats:avg_daily_trips",
+    ],
+    entity_rows=[
+        # Each dict maps the entity join key to a value
+        {"driver_id": 1004},
+        {"driver_id": 1005},
+    ],
+).to_dict()
+
+pprint(feature_vector)
+```
+
+```python Using a feature service
+from pprint import pprint
+from feast import FeatureStore
+
+store = FeatureStore(repo_path=".")
+
+# A FeatureService decouples model requirements from feature view definitions.
+feature_service = store.get_feature_service("driver_activity_v1")
+
+feature_vector = store.get_online_features(
+    features=feature_service,
+    entity_rows=[
+        {"driver_id": 1004},
+        {"driver_id": 1005},
+    ],
+).to_dict()
+
+pprint(feature_vector)
+```
+
+</CodeGroup>
+
+```python
+{
+ 'acc_rate': [0.25351759791374207, 0.8949751853942871],
+ 'avg_daily_trips': [712, 791],
+ 'conv_rate': [0.5038306713104248, 0.9839504361152649],
+ 'driver_id': [1004, 1005]
+}
+```
+
+</Step>
+
+<Step title="Explore the web UI">
+
+Feast includes an experimental web UI for browsing registered features, entities, data sources, and feature services.
+
+```bash
+feast ui
+```
+
+```
+INFO:     Started server process [66664]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8888 (Press CTRL+C to quit)
+```
+
+Open `http://localhost:8888` in your browser to view the feature registry.
+
+</Step>
+
+</Steps>
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Architecture" icon="diagram-project" href="/architecture">
+    Understand how the offline store, online store, registry, and feature server fit together.
+  </Card>
+  <Card title="Feature views and entities" icon="table" href="/concepts/feature-views">
+    Go deeper on defining feature views, entities, and data sources.
+  </Card>
+  <Card title="Materialization" icon="arrows-rotate" href="/guides/materialization">
+    Schedule and automate batch and incremental materialization in production.
+  </Card>
+  <Card title="Cloud providers" icon="cloud" href="/deployment/cloud-providers">
+    Deploy Feast on AWS, GCP, or Snowflake with production-ready stores.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

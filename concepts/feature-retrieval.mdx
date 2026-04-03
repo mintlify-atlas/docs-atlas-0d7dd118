@@ -1,0 +1,373 @@
+---
+title: "Feature Retrieval"
+description: "Learn how to retrieve historical features for model training with get_historical_features(), serve real-time features with get_online_features(), and perform vector similarity search."
+---
+
+Feast supports three primary patterns of feature retrieval:
+
+1. **Training data generation** — `get_historical_features()` with an entity dataframe
+2. **Batch scoring** — `get_historical_features()` with current timestamps for all entities
+3. **Online inference** — `get_online_features()` or the deployed feature server endpoint
+
+All retrieval methods accept a way to specify **which entities** to fetch features for, and **which features** to retrieve (via feature services or feature references).
+
+---
+
+## Point-in-time joins
+
+Before diving into the APIs, it helps to understand **point-in-time joins** — the mechanism that makes historical feature retrieval safe for training.
+
+Feature values in Feast are stored as time-series records. When you call `get_historical_features()`, you provide an entity dataframe with timestamps. For each entity row, Feast retrieves the feature values that were valid **at or before** that timestamp.
+
+```
+Entity dataframe (event_timestamp = prediction time):
+  driver_id=1001, event_timestamp=2021-04-12 10:59:42
+  driver_id=1002, event_timestamp=2021-04-12 08:12:10
+
+Feature view (driver_hourly_stats):
+  driver_id=1001, event_timestamp=2021-04-12 09:00:00, trips_today=5
+  driver_id=1001, event_timestamp=2021-04-12 11:00:00, trips_today=6  ← FUTURE, excluded
+  driver_id=1002, event_timestamp=2021-04-12 07:30:00, trips_today=3
+```
+
+This ensures **point-in-time correctness**, which prevents **data leakage** — the situation where a model can "see the future" during training, leading to inflated offline metrics that don't translate to real-world performance.
+
+The `ttl` parameter on a feature view limits how far back Feast looks. If the most recent feature row for an entity is older than the TTL relative to the entity row's timestamp, no value is joined (resulting in a null).
+
+```python
+from feast import Entity, FeatureView, Field, FileSource
+from feast.types import Float32, Int64
+from datetime import timedelta
+
+driver = Entity(name="driver", join_keys=["driver_id"])
+
+driver_stats_fv = FeatureView(
+    name="driver_hourly_stats",
+    entities=[driver],
+    schema=[
+        Field(name="trips_today", dtype=Int64),
+        Field(name="earnings_today", dtype=Float32),
+    ],
+    ttl=timedelta(hours=2),  # Only look back 2 hours from the entity row timestamp
+    source=FileSource(path="driver_hourly_stats.parquet"),
+)
+```
+
+---
+
+## Feature services
+
+A **feature service** is a logical grouping of features used by a specific model version. Creating one feature service per model version allows you to track feature-model relationships over time.
+
+```python
+from feast import FeatureService
+from driver_ratings_feature_view import driver_ratings_fv
+from driver_trips_feature_view import driver_stats_fv
+
+driver_stats_fs = FeatureService(
+    name="driver_activity_v1",
+    features=[
+        driver_stats_fv,                        # All features from this view
+        driver_ratings_fv[["lifetime_rating"]], # Only this feature from this view
+    ],
+)
+```
+
+<Note>
+Applying a feature service does not deploy a server. It is metadata-only — a way to group and version the features a model depends on.
+</Note>
+
+---
+
+## Feature references
+
+Feature references are string identifiers of the form `<feature_view>:<feature>`. Use them for quick experimentation; switch to feature services for production.
+
+```python
+online_features = fs.get_online_features(
+    features=[
+        "driver_locations:lon",                # latest version (default)
+        "drivers_activity:trips_today",        # latest version (default)
+        "drivers_activity@v2:trips_today",     # specific version
+        "drivers_activity@latest:trips_today", # explicit latest
+    ],
+    entity_rows=[{"driver": "driver_1001"}],
+)
+```
+
+---
+
+## `get_historical_features()` — training data and batch scoring
+
+`get_historical_features` retrieves point-in-time correct feature values from the offline store.
+
+### Step 1: Build an entity dataframe
+
+The entity dataframe must include:
+- The entity key column(s) matching your feature views' join keys
+- An `event_timestamp` column — the upper bound for each row's feature lookup
+
+```python
+import pandas as pd
+from datetime import datetime
+
+entity_df = pd.DataFrame.from_dict({
+    "driver_id": [1001, 1002, 1003, 1004, 1001],
+    "event_timestamp": [
+        datetime(2021, 4, 12, 10, 59, 42),
+        datetime(2021, 4, 12, 8, 12, 10),
+        datetime(2021, 4, 12, 16, 40, 26),
+        datetime(2021, 4, 12, 15, 1, 12),
+        datetime.now(),  # For the most recent feature values
+    ],
+})
+```
+
+You can also use a SQL query to generate the entity dataframe, which is useful for fetching all distinct entities from a data warehouse:
+
+```python
+entity_sql = f"""
+    SELECT
+        driver_id,
+        event_timestamp
+    FROM {store.get_data_source("driver_hourly_stats_source").get_table_query_string()}
+    WHERE event_timestamp BETWEEN '2021-01-01' AND '2021-12-31'
+"""
+```
+
+### Step 2: Call `get_historical_features`
+
+<Tabs>
+  <Tab title="Using a feature service (recommended)">
+    ```python
+    from feast import FeatureStore
+
+    store = FeatureStore(repo_path=".")
+
+    training_df = store.get_historical_features(
+        entity_df=entity_df,
+        features=store.get_feature_service("driver_activity_v1"),
+    ).to_df()
+
+    print(training_df.head())
+    ```
+  </Tab>
+  <Tab title="Using feature references">
+    ```python
+    from feast import FeatureStore
+
+    store = FeatureStore(repo_path=".")
+
+    training_df = store.get_historical_features(
+        entity_df=entity_df,
+        features=[
+            "driver_hourly_stats:conv_rate",
+            "driver_hourly_stats:acc_rate",
+            "driver_daily_features:daily_miles_driven",
+        ],
+    ).to_df()
+    ```
+  </Tab>
+  <Tab title="Batch scoring (current timestamps)">
+    For batch scoring, pass current timestamps to get the latest feature values for all entities:
+
+    ```python
+    from feast import FeatureStore
+
+    store = FeatureStore(repo_path=".")
+
+    entity_sql = f"""
+        SELECT
+            driver_id,
+            CURRENT_TIMESTAMP() AS event_timestamp
+        FROM {store.get_data_source("driver_hourly_stats_source").get_table_query_string()}
+        WHERE event_timestamp BETWEEN '2021-01-01' AND '2021-12-31'
+        GROUP BY driver_id
+    """
+
+    batch_scoring_features = store.get_historical_features(
+        entity_df=entity_sql,
+        features=store.get_feature_service("model_v2"),
+    ).to_df()
+
+    # predictions = model.predict(batch_scoring_features)
+    ```
+  </Tab>
+</Tabs>
+
+### Entity-less retrieval by date range
+
+For time-series models or population-level analysis, you can retrieve all feature values in a time window without constructing an entity dataframe:
+
+```python
+from datetime import datetime
+
+training_df = store.get_historical_features(
+    features=[
+        "driver_hourly_stats:conv_rate",
+        "driver_hourly_stats:acc_rate",
+        "driver_hourly_stats:avg_daily_trips",
+    ],
+    start_date=datetime(2025, 7, 1),
+    end_date=datetime(2025, 7, 2),
+).to_df()
+```
+
+<Warning>
+Entity-less retrieval is currently supported for the **Postgres**, **Dask**, **Spark**, and **Ray** offline stores only. You cannot mix `entity_df` with `start_date`/`end_date` in the same call.
+</Warning>
+
+---
+
+## `get_online_features()` — real-time inference
+
+The online store holds only the **latest** feature values for each entity. Unlike `get_historical_features`, entity rows do **not** need timestamps.
+
+<Tabs>
+  <Tab title="Python SDK">
+    ```python
+    from feast import FeatureStore, RepoConfig
+    from feast.repo_config import RegistryConfig
+
+    store = FeatureStore(repo_path=".")
+
+    features = store.get_online_features(
+        features=[
+            "driver_hourly_stats:conv_rate",
+            "driver_hourly_stats:acc_rate",
+            "driver_daily_features:daily_miles_driven",
+        ],
+        entity_rows=[
+            {"driver_id": 1001},
+            {"driver_id": 1002},
+        ],
+    ).to_dict()
+
+    print(features)
+    ```
+  </Tab>
+  <Tab title="Using a feature service">
+    ```python
+    from feast import FeatureStore
+
+    store = FeatureStore(repo_path=".")
+
+    feature_service = store.get_feature_service("driver_activity_v1")
+    features = store.get_online_features(
+        features=feature_service,
+        entity_rows=[{"driver_id": 1001}],
+    ).to_dict()
+    ```
+  </Tab>
+  <Tab title="Feature server (HTTP)">
+    After deploying a feature server (`feast serve`), you can call it over HTTP:
+
+    ```python
+    import requests
+    import json
+
+    online_request = {
+        "features": [
+            "driver_hourly_stats:conv_rate",
+            "driver_hourly_stats:acc_rate",
+        ],
+        "entities": {"driver_id": [1001, 1002]},
+    }
+
+    response = requests.post(
+        "http://localhost:6566/get-online-features",
+        data=json.dumps(online_request),
+    )
+
+    print(json.dumps(response.json(), indent=4, sort_keys=True))
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## `retrieve_online_documents_v2()` — vector similarity search
+
+For GenAI and RAG applications, Feast supports vector similarity search via the `retrieve_online_documents_v2` method. This retrieves the top-K most similar documents to a query embedding.
+
+First, define a feature view with a vector-indexed field:
+
+```python
+from feast import FeatureView, Field, Entity
+from feast.types import Array, Float32, Int64, String, UnixTimestamp
+from datetime import timedelta
+
+item = Entity(name="item", join_keys=["item_id"])
+
+document_embeddings = FeatureView(
+    name="city_embeddings",
+    entities=[item],
+    schema=[
+        Field(
+            name="vector",
+            dtype=Array(Float32),
+            vector_index=True,          # Enable vector indexing
+            vector_search_metric="COSINE",
+        ),
+        Field(name="item_id", dtype=Int64),
+        Field(name="sentence_chunks", dtype=String),
+        Field(name="wiki_summary", dtype=String),
+        Field(name="event_timestamp", dtype=UnixTimestamp),
+    ],
+    source=rag_documents_source,
+    ttl=timedelta(hours=24),
+)
+```
+
+Then retrieve the most similar documents at query time:
+
+```python
+from feast import FeatureStore
+
+store = FeatureStore(repo_path=".")
+
+# query_embedding is a list of floats from your embedding model
+context_data = store.retrieve_online_documents_v2(
+    features=[
+        "city_embeddings:vector",
+        "city_embeddings:item_id",
+        "city_embeddings:sentence_chunks",
+        "city_embeddings:wiki_summary",
+    ],
+    query=query_embedding,
+    top_k=3,
+    distance_metric="COSINE",
+).to_df()
+```
+
+<Note>
+`retrieve_online_documents_v2` is the recommended method. The older `retrieve_online_documents` method is being deprecated. Currently, Milvus and SQLite support the v2 API.
+</Note>
+
+---
+
+## Datasets
+
+A **dataset** is the output of `get_historical_features` — a materialized dataframe ready for model training. Key distinctions:
+
+- **Dataset vs Feature View**: Feature views define schema and data location. Datasets are the actual data resulting from querying those sources.
+- **Dataset vs Data Source**: Data sources are inputs; datasets are outputs of historical retrieval.
+
+---
+
+## Summary
+
+<CardGroup cols={2}>
+  <Card title="Training data" icon="graduation-cap">
+    Use `get_historical_features()` with an entity dataframe containing past timestamps to generate point-in-time correct training sets.
+  </Card>
+  <Card title="Batch scoring" icon="list-check">
+    Use `get_historical_features()` with current timestamps to score all entities in bulk.
+  </Card>
+  <Card title="Real-time inference" icon="bolt">
+    Use `get_online_features()` or the feature server HTTP endpoint to retrieve the latest feature values at millisecond latency.
+  </Card>
+  <Card title="Vector search" icon="magnifying-glass">
+    Use `retrieve_online_documents_v2()` for RAG and semantic search applications.
+  </Card>
+</CardGroup>

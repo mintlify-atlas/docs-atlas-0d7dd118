@@ -1,0 +1,321 @@
+---
+title: "Materialization"
+description: "Load features from your offline store into the online store so they are available for low-latency serving."
+---
+
+Materialization is the process of reading feature data from an offline store (a data warehouse or data lake) and writing it to an online store (Redis, DynamoDB, Bigtable, etc.) where it can be served with low latency.
+
+Without materialization, `get_online_features` returns nothing — the online store is only populated by explicitly running a materialization job or by pushing features via the Push API.
+
+```
+Offline store           Feast materialization          Online store
+(BigQuery / Redshift) ─────────────────────────────► (Redis / DynamoDB)
+     historical data                                  low-latency serving
+```
+
+---
+
+## `feast materialize` vs `feast materialize-incremental`
+
+| Command | What it loads | When to use |
+|---|---|---|
+| `feast materialize START END` | All data in the `[START, END]` window | Initial backfill or when you need a specific time range |
+| `feast materialize-incremental END` | Data from the last materialization end time up to `END` | Ongoing scheduled runs |
+
+`materialize-incremental` automatically tracks where the previous run ended (stored in the registry) and resumes from there. On first run with no prior history, it falls back to `now - ttl` as the start time.
+
+---
+
+## CLI usage
+
+<CodeGroup>
+```bash materialize (full range)
+# Load features for a specific time window
+feast materialize 2024-01-01T00:00:00 2024-01-31T23:59:59
+
+# Load only specific feature views
+feast materialize 2024-01-01T00:00:00 2024-01-31T23:59:59 \
+  --views driver_hourly_stats
+```
+
+```bash materialize-incremental
+# Load new data up to the current time
+CURRENT_TIME=$(date -u +"%Y-%m-%dT%H:%M:%S")
+feast materialize-incremental $CURRENT_TIME
+
+# Load only specific feature views incrementally
+feast materialize-incremental $CURRENT_TIME --views driver_hourly_stats
+```
+
+```bash materialize (no event timestamps)
+# For data sources without event timestamps
+feast materialize --disable-event-timestamp
+```
+</CodeGroup>
+
+---
+
+## Python API
+
+### `store.materialize()`
+
+Loads data from the offline store within an explicit `[start_date, end_date]` window.
+
+```python materialize.py
+from feast import FeatureStore
+from datetime import datetime, timezone
+
+store = FeatureStore(repo_path="feature_repo/")
+
+store.materialize(
+    start_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+    end_date=datetime(2024, 1, 31, 23, 59, 59, tzinfo=timezone.utc),
+)
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `start_date` | `datetime` | Start of the time range to materialize |
+| `end_date` | `datetime` | End of the time range to materialize |
+| `feature_views` | `List[str]` | Optional list of feature view names to restrict materialization |
+| `disable_event_timestamp` | `bool` | Treat all rows as if the event timestamp is now; use for sources without timestamps |
+| `full_feature_names` | `bool` | Prefix feature names with the feature view name |
+
+### `store.materialize_incremental()`
+
+Loads only new data since the last materialization run, up to `end_date`.
+
+```python materialize_incremental.py
+from feast import FeatureStore
+from datetime import datetime, timezone, timedelta
+
+store = FeatureStore(repo_path="feature_repo/")
+
+# Materialize everything up to 5 minutes ago
+store.materialize_incremental(
+    end_date=datetime.now(tz=timezone.utc) - timedelta(minutes=5),
+)
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `end_date` | `datetime` | Upper bound of the time range to materialize |
+| `feature_views` | `List[str]` | Optional list of feature view names to restrict materialization |
+| `full_feature_names` | `bool` | Prefix feature names with the feature view name |
+
+<Warning>
+  `materialize_incremental` requires either a `ttl` to be set on the feature view, or for `materialize` to have been run at least once. Without either, Feast does not know where to start reading data.
+</Warning>
+
+---
+
+## Partial materialization
+
+To run materialization for only a subset of feature views, pass their names explicitly:
+
+```python partial_materialize.py
+from feast import FeatureStore
+from datetime import datetime, timezone, timedelta
+
+store = FeatureStore(repo_path="feature_repo/")
+
+# Only materialize the driver stats feature view
+store.materialize_incremental(
+    end_date=datetime.now(tz=timezone.utc),
+    feature_views=["driver_hourly_stats"],
+)
+```
+
+This is useful when different feature views have different update frequencies — for example, user features might refresh daily while driver features refresh hourly.
+
+---
+
+## Scheduling materialization jobs
+
+### With Airflow
+
+Airflow is the recommended scheduler for production materialization. Use a `PythonOperator` and construct the `FeatureStore` directly in the task so the Airflow worker can connect to your stores:
+
+```python airflow_materialize_dag.py
+from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.decorators import task
+from feast import FeatureStore, RepoConfig
+from feast.infra.online_stores.redis import RedisOnlineStoreConfig
+from feast.repo_config import RegistryConfig
+
+default_args = {"owner": "ml-platform", "retries": 2}
+
+with DAG(
+    dag_id="feast_materialization",
+    default_args=default_args,
+    schedule_interval="0 * * * *",   # every hour
+    start_date=datetime(2024, 1, 1),
+    catchup=False,
+) as dag:
+
+    @task()
+    def materialize(data_interval_start=None, data_interval_end=None):
+        repo_config = RepoConfig(
+            registry=RegistryConfig(
+                registry_type="sql",
+                path="postgresql://user:pass@db-host/feast_registry",
+            ),
+            project="my_project",
+            provider="local",
+            offline_store="bigquery",
+            online_store=RedisOnlineStoreConfig(
+                connection_string="redis://redis-host:6379"
+            ),
+            entity_key_serialization_version=3,
+        )
+        store = FeatureStore(config=repo_config)
+        # Add 1-hour overlap to account for late-arriving data
+        store.materialize(
+            start_date=data_interval_start.subtract(hours=1),
+            end_date=data_interval_end,
+        )
+
+    materialize()
+```
+
+### With the CLI and cron
+
+For simpler setups, a cron job running the CLI is sufficient:
+
+```bash crontab
+# Run incremental materialization every hour
+0 * * * * cd /app/feature_repo && feast materialize-incremental $(date -u +"\%Y-\%m-\%dT\%H:\%M:\%S")
+```
+
+### Using a BashOperator in Airflow
+
+```python airflow_bash_materialize.py
+from airflow.operators.bash import BashOperator
+import datetime
+
+materialize_task = BashOperator(
+    task_id="feast_materialize",
+    bash_command=(
+        "feast materialize-incremental "
+        + datetime.datetime.now(tz=datetime.timezone.utc)
+          .replace(microsecond=0)
+          .isoformat()
+    ),
+)
+```
+
+---
+
+## Source-to-online-store flow
+
+<Steps>
+  <Step title="Define your feature view with a batch source">
+    ```python feature_views.py
+    from feast import FeatureView, Field, BigQuerySource
+    from feast.types import Float64, Int64
+    from datetime import timedelta
+
+    driver_hourly_stats = FeatureView(
+        name="driver_hourly_stats",
+        entities=["driver_id"],
+        ttl=timedelta(hours=2),
+        schema=[
+            Field(name="conv_rate", dtype=Float64),
+            Field(name="acc_rate", dtype=Float64),
+            Field(name="avg_daily_trips", dtype=Int64),
+        ],
+        source=BigQuerySource(
+            table="my_project.feast_data.driver_hourly_stats",
+            timestamp_field="event_timestamp",
+        ),
+    )
+    ```
+  </Step>
+
+  <Step title="Apply the feature view to register it">
+    ```bash
+    feast apply
+    ```
+  </Step>
+
+  <Step title="Run materialization to populate the online store">
+    ```bash
+    feast materialize-incremental $(date -u +"%Y-%m-%dT%H:%M:%S")
+    ```
+
+    Or via Python:
+
+    ```python
+    from feast import FeatureStore
+    from datetime import datetime, timezone
+
+    store = FeatureStore(repo_path=".")
+    store.materialize_incremental(end_date=datetime.now(tz=timezone.utc))
+    ```
+  </Step>
+
+  <Step title="Retrieve features from the online store">
+    ```python
+    feature_vector = store.get_online_features(
+        features=["driver_hourly_stats:conv_rate", "driver_hourly_stats:acc_rate"],
+        entity_rows=[{"driver_id": 1001}],
+    ).to_dict()
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Scalable materialization engines
+
+The default materialization engine runs in-process and loads all data into memory. For large feature views, this can be a bottleneck.
+
+<CardGroup cols={2}>
+  <Card title="Snowflake Compute Engine" icon="snowflake">
+    Best choice when your offline and online workloads are both on Snowflake. Pushes computation into Snowflake rather than pulling data into the Feast process.
+  </Card>
+  <Card title="Bytewax Engine" icon="server">
+    Suitable when your workloads run on Kubernetes but not on Snowflake. Distributes materialization across multiple workers.
+  </Card>
+  <Card title="Lambda Engine" icon="bolt">
+    AWS Lambda-based materialization for serverless deployments.
+  </Card>
+  <Card title="Custom Engine" icon="wrench">
+    Implement the `BatchMaterializationEngine` interface to integrate with your existing infrastructure (e.g. Spark or Ray).
+  </Card>
+</CardGroup>
+
+<Note>
+  Whichever engine you use, the registry must be SQL-backed when running concurrent materialization jobs to avoid write conflicts.
+</Note>
+
+---
+
+## On-demand feature views and materialization
+
+On-demand feature views with `write_to_online_store=True` can also be materialized. If you have already transformed your data in a batch pipeline, you can skip the transformation during write by setting `transform_on_write=False`:
+
+```python skip_transform_on_write.py
+from feast import FeatureStore
+import pandas as pd
+
+store = FeatureStore(repo_path=".")
+
+# Pre-transformed data — transformations already applied upstream
+pre_transformed_data = pd.DataFrame({
+    "driver_id": [1001],
+    "event_timestamp": [pd.Timestamp.now(tz="UTC")],
+    "conv_rate_adjusted": [0.55],  # already computed
+})
+
+store.write_to_online_store(
+    feature_view_name="transformed_conv_rate",
+    df=pre_transformed_data,
+    transform_on_write=False,  # skip re-applying the transformation
+)
+```

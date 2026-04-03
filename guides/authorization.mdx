@@ -1,0 +1,447 @@
+---
+title: "Authorization"
+description: "Secure your feature store with role-based, group-based, and namespace-based access control using Feast permissions and OIDC or Kubernetes auth."
+---
+
+Feast includes a permissions framework that lets you control which users can perform which actions on which resources. Access is enforced at the server level — the online feature server (REST), offline feature server (Arrow Flight), and registry server (gRPC) all check permissions before executing requests.
+
+<Note>
+  Feast does not provide authentication. Your client is responsible for obtaining a token and passing it to the Feast server. Feast validates the token and extracts user details from your configured auth provider (OIDC or Kubernetes RBAC).
+</Note>
+
+<Info>
+  Permission enforcement only applies when accessing Feast through one of its servers. There is **no** enforcement when using the Feast Python SDK against a local provider.
+</Info>
+
+---
+
+## Core concepts
+
+The permission model has three building blocks:
+
+- **Resource** — any Feast object (`FeatureView`, `FeatureService`, `DataSource`, `Entity`, etc.)
+- **Action** — an operation on a resource (`create`, `describe`, `update`, `delete`, `read`, `read_online`, `read_offline`, `write`, `write_online`, `write_offline`)
+- **Policy** — a rule that determines whether a user is allowed to perform an action
+
+The `Permission` class ties these together:
+
+| Field | Description |
+|---|---|
+| `name` | Unique name for this permission |
+| `types` | Resource type(s) this permission applies to (defaults to all types) |
+| `name_patterns` | Regex pattern(s) to filter resources by name |
+| `required_tags` | Key-value tags that the resource must have |
+| `actions` | Allowed actions |
+| `policy` | The policy that determines who is granted access |
+
+---
+
+## Defining permissions
+
+### Allow readers to describe and read feature views
+
+```python permissions.py
+from feast import FeatureView, FeatureService
+from feast.permissions.permission import Permission
+from feast.permissions.policy import RoleBasedPolicy
+from feast.permissions.action import AuthzedAction, READ
+
+reader_permission = Permission(
+    name="feature-reader",
+    types=[FeatureView, FeatureService],
+    policy=RoleBasedPolicy(roles=["super-reader"]),
+    actions=[AuthzedAction.DESCRIBE, *READ],
+)
+```
+
+`READ` expands to `[AuthzedAction.READ_ONLINE, AuthzedAction.READ_OFFLINE]`. The convenience constants available are:
+
+| Constant | Included actions |
+|---|---|
+| `READ` | `read_online`, `read_offline` |
+| `WRITE` | `write_online`, `write_offline` |
+| `CRUD` | `create`, `describe`, `update`, `delete` |
+| `ALL_ACTIONS` | All of the above |
+| `ALL_RESOURCE_TYPES` | All `FeastObject` types |
+| `ALL_FEATURE_VIEW_TYPES` | All feature view types including `OnDemandFeatureView` |
+
+### Restrict writes to high-risk data sources
+
+```python permissions.py
+from feast import DataSource
+from feast.permissions.permission import Permission
+from feast.permissions.policy import RoleBasedPolicy
+from feast.permissions.action import AuthzedAction
+
+ds_write_permission = Permission(
+    name="ds-writer",
+    types=[DataSource],
+    required_tags={"risk_level": "high"},
+    policy=RoleBasedPolicy(roles=["admin", "data_team"]),
+    actions=[AuthzedAction.WRITE],
+)
+```
+
+<Note>
+  When multiple roles are listed in `RoleBasedPolicy`, the user needs at least **one** of those roles. Role matching is case-sensitive.
+</Note>
+
+### Filter by resource name pattern
+
+```python permissions.py
+from feast import FeatureView
+from feast.permissions.permission import Permission
+from feast.permissions.policy import RoleBasedPolicy
+from feast.permissions.action import AuthzedAction
+
+sensitive_fv_permission = Permission(
+    name="reader",
+    types=[FeatureView],
+    name_patterns=".*risky.*",   # matches any feature view with "risky" in the name
+    policy=RoleBasedPolicy(roles=["trusted"]),
+    actions=[AuthzedAction.READ_OFFLINE],
+)
+```
+
+`name_patterns` accepts either a `str` or `list[str]` of regex patterns. A resource matches if any pattern matches its name.
+
+### Apply permissions during `feast apply`
+
+Register permissions alongside your other Feast objects:
+
+```python feature_repo/permissions.py
+from feast import FeatureView, FeatureService, DataSource
+from feast.feast_object import ALL_RESOURCE_TYPES
+from feast.permissions.permission import Permission
+from feast.permissions.policy import RoleBasedPolicy
+from feast.permissions.action import AuthzedAction, READ, WRITE, ALL_ACTIONS
+
+# Data scientists can read everything
+reader_perm = Permission(
+    name="data-scientist-reader",
+    types=ALL_RESOURCE_TYPES,
+    policy=RoleBasedPolicy(roles=["data-scientist"]),
+    actions=[AuthzedAction.DESCRIBE, *READ],
+)
+
+# ML engineers can write to the online store
+ml_engineer_perm = Permission(
+    name="ml-engineer-writer",
+    types=[FeatureView],
+    policy=RoleBasedPolicy(roles=["ml-engineer"]),
+    actions=[AuthzedAction.WRITE_ONLINE],
+)
+
+# Admins have full access
+admin_perm = Permission(
+    name="admin-full-access",
+    types=ALL_RESOURCE_TYPES,
+    policy=RoleBasedPolicy(roles=["admin"]),
+    actions=ALL_ACTIONS,
+)
+```
+
+```bash
+feast apply
+```
+
+---
+
+## Authentication providers
+
+### No authorization (default)
+
+If you omit the `auth` section from `feature_store.yaml`, Feast uses `no_auth` and enforces no permissions:
+
+```yaml feature_store.yaml
+project: my_project
+auth:
+  type: no_auth
+```
+
+### OIDC authorization
+
+With OIDC, clients obtain a JWT token from an identity provider and send it as a Bearer token in every request. The Feast server validates the token and extracts roles from the `resource_access` claim.
+
+**Server configuration:**
+
+```yaml feature_store.yaml (server)
+project: my_project
+auth:
+  type: oidc
+  client_id: app
+  auth_discovery_url: https://my-keycloak.example.com/realms/master/.well-known/openid-configuration
+```
+
+**Client configuration:**
+
+```yaml feature_store.yaml (client)
+project: my_project
+auth:
+  type: oidc
+  client_id: app
+  client_secret: my_client_secret
+  username: alice
+  password: alice_password
+  auth_discovery_url: https://my-keycloak.example.com/realms/master/.well-known/openid-configuration
+```
+
+The JWT access token must expose roles in the `resource_access` claim. For a client `app` with role `reader`:
+
+```json example JWT resource_access claim
+{
+  "resource_access": {
+    "app": {
+      "roles": ["reader"]
+    }
+  }
+}
+```
+
+<Warning>
+  Role names in the OIDC token and in `Permission` definitions must match exactly — role matching is **case-sensitive**.
+</Warning>
+
+### Kubernetes RBAC authorization
+
+With Kubernetes auth, the client uses its service account token as the Bearer token. The Feast server uses the Kubernetes Token Access Review API to extract the roles, groups, and namespaces associated with the token.
+
+**Server configuration:**
+
+```yaml feature_store.yaml (server on Kubernetes)
+project: my_project
+auth:
+  type: kubernetes
+```
+
+**Client configuration (running in-cluster):**
+
+```yaml feature_store.yaml (client in-cluster)
+project: my_project
+auth:
+  type: kubernetes
+```
+
+**Client running outside the cluster:**
+
+```yaml feature_store.yaml (external client)
+project: my_project
+auth:
+  type: kubernetes
+  user_token: <service_account_token>
+```
+
+Or set the `LOCAL_K8S_TOKEN` environment variable to avoid embedding the token in the file.
+
+---
+
+## Kubernetes RBAC setup
+
+<Steps>
+  <Step title="Create Kubernetes Roles matching Feast Permission roles">
+    The role names in your `Permission` definitions must correspond to Kubernetes `Role` names in the same namespace as the Feast service:
+
+    ```yaml feast-reader-role.yaml
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: Role
+    metadata:
+      name: feast-reader          # matches roles=["feast-reader"] in Permission
+      namespace: feast
+    rules:
+      - apiGroups: [""]
+        resources: ["services"]
+        verbs: ["get", "list"]
+    ```
+  </Step>
+
+  <Step title="Create a ServiceAccount for your client application">
+    ```yaml client-serviceaccount.yaml
+    apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: my-ml-app
+      namespace: ml-apps
+    ```
+  </Step>
+
+  <Step title="Bind the client ServiceAccount to the Feast Role">
+    The `RoleBinding` must be in the **Feast service's namespace**:
+
+    ```yaml feast-reader-binding.yaml
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    metadata:
+      name: ml-app-feast-reader
+      namespace: feast                 # namespace of the Feast service
+    subjects:
+      - kind: ServiceAccount
+        name: my-ml-app
+        namespace: ml-apps             # namespace where the client runs
+    roleRef:
+      kind: Role
+      name: feast-reader               # must match the Permission role name
+      apiGroup: rbac.authorization.k8s.io
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Policy types
+
+<Tabs>
+  <Tab title="Role-based">
+    ```python
+    from feast.permissions.policy import RoleBasedPolicy
+
+    policy = RoleBasedPolicy(roles=["data-team", "ml-engineers"])
+    ```
+
+    The user must have at least one of the listed roles.
+  </Tab>
+
+  <Tab title="Group-based">
+    ```python
+    from feast.permissions.policy import GroupBasedPolicy
+
+    policy = GroupBasedPolicy(groups=["data-team", "ml-engineers"])
+    ```
+
+    Requires Kubernetes auth. Grants access based on the Kubernetes groups the user or service account belongs to.
+  </Tab>
+
+  <Tab title="Namespace-based">
+    ```python
+    from feast.permissions.policy import NamespaceBasedPolicy
+
+    policy = NamespaceBasedPolicy(namespaces=["production", "staging"])
+    ```
+
+    Requires Kubernetes auth. Grants access when the user or service account is associated with one of the listed namespaces.
+  </Tab>
+
+  <Tab title="Combined group + namespace">
+    ```python
+    from feast.permissions.policy import CombinedGroupNamespacePolicy
+
+    policy = CombinedGroupNamespacePolicy(
+        groups=["dev-team"],
+        namespaces=["staging"],
+    )
+    ```
+
+    Grants access when the user is in one of the specified groups **or** namespaces.
+  </Tab>
+</Tabs>
+
+---
+
+## Comprehensive permissions example
+
+```python feature_repo/permissions.py
+from feast import FeatureView, FeatureService, DataSource, Entity
+from feast.feast_object import ALL_RESOURCE_TYPES
+from feast.permissions.action import AuthzedAction, READ, WRITE, CRUD, ALL_ACTIONS
+from feast.permissions.permission import Permission
+from feast.permissions.policy import (
+    RoleBasedPolicy,
+    GroupBasedPolicy,
+    NamespaceBasedPolicy,
+    CombinedGroupNamespacePolicy,
+)
+
+# Data scientists can read all feature views and services
+data_scientist_perm = Permission(
+    name="data-scientist-read",
+    types=[FeatureView, FeatureService],
+    policy=GroupBasedPolicy(groups=["data-scientists"]),
+    actions=[AuthzedAction.DESCRIBE, *READ],
+)
+
+# Production namespace has full read access to all resources
+prod_read_perm = Permission(
+    name="production-read",
+    types=ALL_RESOURCE_TYPES,
+    policy=NamespaceBasedPolicy(namespaces=["production"]),
+    actions=[AuthzedAction.DESCRIBE, *READ],
+)
+
+# ML engineers in staging can read and write online store
+ml_staging_perm = Permission(
+    name="ml-staging-online-write",
+    types=[FeatureView],
+    policy=CombinedGroupNamespacePolicy(
+        groups=["ml-engineers"],
+        namespaces=["staging"],
+    ),
+    actions=[AuthzedAction.READ_ONLINE, AuthzedAction.WRITE_ONLINE],
+)
+
+# Admins have full control over everything
+admin_perm = Permission(
+    name="admin-full-access",
+    types=ALL_RESOURCE_TYPES,
+    policy=RoleBasedPolicy(roles=["admin"]),
+    actions=ALL_ACTIONS,
+)
+
+# Protect high-risk data sources — only the data team can write
+risky_ds_perm = Permission(
+    name="risky-ds-write",
+    types=[DataSource],
+    required_tags={"risk_level": "high"},
+    policy=RoleBasedPolicy(roles=["data-team"]),
+    actions=[AuthzedAction.WRITE],
+)
+```
+
+---
+
+## Managing permissions via CLI
+
+```bash
+# List all configured permissions
+feast permissions list
+
+# Show which resources match a specific permission
+feast permissions list --verbose
+
+# Show resources not covered by any permission
+feast permissions check
+```
+
+---
+
+## Permission granting order
+
+When a user request is evaluated against multiple permissions:
+
+1. Permissions are evaluated in order.
+2. The **first** permission whose policy matches the user grants or denies the action.
+3. If **no** permission matches, the action is **denied**.
+
+Resources that match no permission at all are effectively open — any user can perform any action on them. Configure a deny-all catch-all permission if you need to lock down all resources by default.
+
+---
+
+## Best practices
+
+<Accordion title="Principle of least privilege">
+  Grant only the actions a role genuinely needs. Start with read-only access and expand incrementally. Avoid `ALL_ACTIONS` for any role other than admins.
+</Accordion>
+
+<Accordion title="Organize users into logical groups">
+  Prefer group-based or namespace-based policies over role-based policies when using Kubernetes auth. Groups map naturally to team boundaries and are easier to audit.
+</Accordion>
+
+<Accordion title="Use tags to partition sensitive resources">
+  Tag data sources and feature views with metadata like `risk_level: high` or `pii: true` and write permissions that reference those tags. This avoids maintaining long lists of resource names.
+</Accordion>
+
+<Accordion title="Audit permissions regularly">
+  Run `feast permissions list --verbose` periodically to confirm that coverage is correct and no resources are unintentionally open.
+</Accordion>
+
+<Accordion title="Keep server and client auth config in sync">
+  Feast clients automatically inject the authorization token that the server expects. Both must reference the same `auth.type` and compatible settings, or requests will fail with authentication errors.
+</Accordion>

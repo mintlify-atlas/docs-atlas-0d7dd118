@@ -1,0 +1,597 @@
+---
+title: "Data Sources"
+description: "Reference for all data source types supported by Feast, including batch sources for historical features and stream sources for real-time ingestion."
+---
+
+Data sources are the underlying storage systems that Feast reads feature data from. Each batch data source is associated with a corresponding offline store — for example, a `BigQuerySource` can only be processed by the BigQuery offline store, while a `FileSource` can be processed by the File or DuckDB offline stores.
+
+<Info>
+  Feast has an internal type system that supports primitive types (`bytes`, `string`, `int32`, `int64`, `float32`, `float64`, `bool`, `timestamp`), array types, set types, map/JSON types, and struct types. Not every data source supports all types — see the matrix below.
+</Info>
+
+## Type support matrix
+
+| | File | BigQuery | Snowflake | Redshift | Postgres | Spark | Trino |
+|:--|:--|:--|:--|:--|:--|:--|:--|
+| `bytes` | yes | yes | yes | yes | yes | yes | yes |
+| `string` | yes | yes | yes | yes | yes | yes | yes |
+| `int32` | yes | yes | yes | yes | yes | yes | yes |
+| `int64` | yes | yes | yes | yes | yes | yes | yes |
+| `float32` | yes | yes | yes | yes | yes | yes | yes |
+| `float64` | yes | yes | yes | yes | yes | yes | yes |
+| `bool` | yes | yes | yes | yes | yes | yes | yes |
+| `timestamp` | yes | yes | yes | yes | yes | yes | yes |
+| Array types | yes | yes | yes | no | yes | yes | yes |
+| `Map` | yes | no | yes | yes | yes | yes | yes |
+| `Json` | yes | yes | yes | yes | yes | no | no |
+| `Struct` | yes | yes | no | no | yes | yes | no |
+| Set types | yes\* | no | no | no | no | no | no |
+
+\* Set types must be explicitly declared in the feature view schema and are not inferred by any backend.
+
+---
+
+## Batch data sources
+
+<AccordionGroup>
+
+<Accordion title="FileSource — Parquet / Delta files (local or cloud)">
+
+`FileSource` reads from Parquet or Delta format files stored on a local filesystem or in object storage (S3, GCS).
+
+**Supported types:** All eight primitive types and their corresponding array types.
+
+```python
+from feast import FileSource
+from feast.data_format import ParquetFormat
+
+parquet_file_source = FileSource(
+    name="driver_stats_source",
+    file_format=ParquetFormat(),
+    path="s3://my-bucket/data/driver_stats.parquet",
+    timestamp_field="event_timestamp",
+    created_timestamp_column="created",
+)
+```
+
+<ParamField path="body.path" type="string" required>
+  URI to the file or directory. Supports `file://`, `s3://`, and `gs://` schemes.
+</ParamField>
+
+<ParamField path="body.file_format" type="FileFormat" required>
+  Format of the files. Use `ParquetFormat()` or `DeltaFormat()`.
+</ParamField>
+
+<ParamField path="body.timestamp_field" type="string">
+  Column name containing the event timestamp used for point-in-time joins.
+</ParamField>
+
+<ParamField path="body.created_timestamp_column" type="string">
+  Column name for the row creation timestamp, used as a tie-breaker.
+</ParamField>
+
+<ParamField path="body.name" type="string">
+  Unique name for this data source within the feature store.
+</ParamField>
+
+<ParamField path="body.field_mapping" type="dict">
+  Dictionary mapping source column names to Feast field names.
+</ParamField>
+
+<Note>
+  No additional pip extras are required for local Parquet files. For S3 access, install `pip install 'feast[aws]'`. For GCS, install `pip install 'feast[gcp]'`.
+</Note>
+
+</Accordion>
+
+<Accordion title="BigQuerySource — Google BigQuery tables or views">
+
+`BigQuerySource` reads from BigQuery tables or views. Sources can be defined by a table reference or a SQL query — table references are recommended for performance.
+
+**Supported types:** All eight primitive types, array types, JSON, and Struct.
+
+**Install:** `pip install 'feast[gcp]'`
+
+<CodeGroup>
+
+```python table_reference.py
+from feast import BigQuerySource
+
+my_bigquery_source = BigQuerySource(
+    name="driver_stats",
+    table_ref="my_gcp_project:my_dataset.driver_stats",
+    timestamp_field="event_timestamp",
+    created_timestamp_column="created",
+)
+```
+
+```python sql_query.py
+from feast import BigQuerySource
+
+my_bigquery_source = BigQuerySource(
+    name="driver_stats_query",
+    query="SELECT event_timestamp, created, f1, f2 "
+          "FROM `my_project.my_dataset.driver_stats`",
+    timestamp_field="event_timestamp",
+)
+```
+
+</CodeGroup>
+
+<ParamField path="body.table_ref" type="string">
+  BigQuery table reference in the format `project:dataset.table`. Recommended over `query`.
+</ParamField>
+
+<ParamField path="body.query" type="string">
+  SQL query string. No performance guarantees — prefer `table_ref` when possible.
+</ParamField>
+
+<ParamField path="body.timestamp_field" type="string">
+  Column name for the event timestamp.
+</ParamField>
+
+<ParamField path="body.created_timestamp_column" type="string">
+  Column name for the row creation timestamp.
+</ParamField>
+
+</Accordion>
+
+<Accordion title="SnowflakeSource — Snowflake tables or views">
+
+`SnowflakeSource` reads from Snowflake tables or views, using either a table reference or a SQL query.
+
+**Supported types:** All eight primitive types. Array types are supported but not inferred automatically.
+
+**Install:** `pip install 'feast[snowflake]'`
+
+<CodeGroup>
+
+```python table_reference.py
+from feast import SnowflakeSource
+
+my_snowflake_source = SnowflakeSource(
+    name="driver_stats",
+    database="FEAST",
+    schema="PUBLIC",
+    table="DRIVER_STATS",
+    timestamp_field="event_timestamp",
+    created_timestamp_column="created",
+)
+```
+
+```python sql_query.py
+from feast import SnowflakeSource
+
+my_snowflake_source = SnowflakeSource(
+    name="driver_stats_query",
+    query="""
+    SELECT
+        event_timestamp AS "ts",
+        "created",
+        "f1",
+        "f2"
+    FROM
+        FEAST.PUBLIC.DRIVER_STATS
+    """,
+    timestamp_field="ts",
+)
+```
+
+</CodeGroup>
+
+<ParamField path="body.database" type="string">
+  Snowflake database name.
+</ParamField>
+
+<ParamField path="body.schema" type="string">
+  Snowflake schema name.
+</ParamField>
+
+<ParamField path="body.table" type="string">
+  Snowflake table or view name.
+</ParamField>
+
+<ParamField path="body.query" type="string">
+  SQL query string. Avoid single-quoted string literals — use dollar-quoted strings (`$$value$$`) instead.
+</ParamField>
+
+<Warning>
+  Avoid single quotes inside SQL query strings when using Snowflake. Replace `'value'` with `$$value$$` as described in the [Snowflake documentation](https://docs.snowflake.com/en/sql-reference/data-types-text#label-dollar-quoted-string-constants).
+</Warning>
+
+</Accordion>
+
+<Accordion title="RedshiftSource — Amazon Redshift tables or views">
+
+`RedshiftSource` reads from Amazon Redshift tables or views. Table references are recommended over SQL queries for best performance.
+
+**Supported types:** All eight primitive types. Array types are not currently supported.
+
+**Install:** `pip install 'feast[aws]'`
+
+<CodeGroup>
+
+```python table_reference.py
+from feast import RedshiftSource
+
+my_redshift_source = RedshiftSource(
+    name="driver_stats",
+    table="driver_stats",
+    timestamp_field="event_timestamp",
+    created_timestamp_column="created",
+)
+```
+
+```python sql_query.py
+from feast import RedshiftSource
+
+my_redshift_source = RedshiftSource(
+    name="driver_stats_query",
+    query="SELECT event_timestamp as ts, created, f1, f2 "
+          "FROM driver_stats",
+    timestamp_field="ts",
+)
+```
+
+</CodeGroup>
+
+<ParamField path="body.table" type="string">
+  Redshift table or view name.
+</ParamField>
+
+<ParamField path="body.query" type="string">
+  SQL query string. No performance guarantees — prefer `table` when possible.
+</ParamField>
+
+<ParamField path="body.timestamp_field" type="string">
+  Column name for the event timestamp.
+</ParamField>
+
+<ParamField path="body.created_timestamp_column" type="string">
+  Column name for the row creation timestamp.
+</ParamField>
+
+</Accordion>
+
+<Accordion title="AthenaSource — Amazon Athena (contrib)">
+
+`AthenaSource` reads from AWS Athena tables or views via the AWS Glue Data Catalog.
+
+**Install:** `pip install 'feast[aws]'`
+
+<Warning>
+  The Athena data source is a community contribution and does not achieve full test coverage. Stability is not guaranteed.
+</Warning>
+
+```python
+from feast.infra.offline_stores.contrib.athena_offline_store.athena_source import (
+    AthenaSource,
+)
+
+driver_stats_source = AthenaSource(
+    name="driver_hourly_stats",
+    table="driver_hourly_stats",
+    database="my_database",
+    data_source="AwsDataCatalog",
+    timestamp_field="event_timestamp",
+    created_timestamp_column="created",
+)
+```
+
+<ParamField path="body.table" type="string">
+  Athena table name.
+</ParamField>
+
+<ParamField path="body.database" type="string">
+  Athena database name.
+</ParamField>
+
+<ParamField path="body.data_source" type="string" default="AwsDataCatalog">
+  Athena data source (Glue catalog name).
+</ParamField>
+
+<ParamField path="body.timestamp_field" type="string">
+  Column name for the event timestamp.
+</ParamField>
+
+</Accordion>
+
+</AccordionGroup>
+
+---
+
+## Streaming data sources
+
+Streaming data sources allow Feast to ingest real-time feature values into the online store (and optionally the offline store). A typical streaming pipeline looks like:
+
+1. Raw events arrive on a stream (Kafka, Kinesis, etc.)
+2. Transformations are applied to produce feature values
+3. Feature values are written to the online store for low-latency serving
+4. Feature values are optionally written to the offline store as a historical log
+
+<AccordionGroup>
+
+<Accordion title="PushSource — push-based ingestion from any source">
+
+`PushSource` allows feature values to be pushed directly to the online store and/or offline store in real time, without requiring a dedicated streaming infrastructure integration. It supersedes `FeatureStore.write_to_online_store`.
+
+Push sources can be shared by multiple feature views. An optional `batch_source` enables historical feature retrieval and materialization.
+
+```python
+from feast import (
+    Entity,
+    FeatureView,
+    Field,
+    PushSource,
+    BigQuerySource,
+)
+from feast.types import Int64
+
+push_source = PushSource(
+    name="driver_push_source",
+    batch_source=BigQuerySource(
+        table="my_project:my_dataset.driver_stats",
+    ),
+)
+
+driver = Entity(name="driver", join_keys=["driver_id"])
+
+driver_fv = FeatureView(
+    name="driver_stats",
+    entities=[driver],
+    schema=[Field(name="trips_today", dtype=Int64)],
+    source=push_source,
+)
+```
+
+After registration, push data to the store:
+
+```python
+from feast import FeatureStore
+from feast.data_source import PushMode
+import pandas as pd
+
+fs = FeatureStore(repo_path=".")
+
+df = pd.DataFrame({
+    "driver_id": [1001, 1002],
+    "trips_today": [5, 3],
+    "event_timestamp": pd.to_datetime(["2024-01-01", "2024-01-01"]),
+})
+
+# Push to online store only (default)
+fs.push("driver_push_source", df, to=PushMode.ONLINE)
+
+# Push to both stores
+fs.push("driver_push_source", df, to=PushMode.ONLINE_AND_OFFLINE)
+```
+
+**With Spark Streaming:**
+
+```python
+from feast import FeatureStore
+
+store = FeatureStore(repo_path=".")
+
+from pyspark.sql import SparkSession
+spark = SparkSession.builder.getOrCreate()
+streaming_df = spark.readStream.format("kafka").load()
+
+def feast_writer(spark_df):
+    pandas_df = spark_df.toPandas()
+    store.push("driver_push_source", pandas_df)
+
+streaming_df.writeStream.foreachBatch(feast_writer).start()
+```
+
+<ParamField path="body.name" type="string" required>
+  Unique name for the push source.
+</ParamField>
+
+<ParamField path="body.batch_source" type="BatchSource">
+  Optional batch source for historical feature retrieval and materialization. If omitted, offline retrieval is unavailable.
+</ParamField>
+
+<ParamField path="body.schema" type="list[Field]">
+  Optional list of fields. If omitted, schema is inferred from the feature view.
+</ParamField>
+
+</Accordion>
+
+<Accordion title="KafkaSource — Apache Kafka streams (experimental)">
+
+`KafkaSource` registers an Apache Kafka topic as a stream data source. Feast does not manage Kafka consumers — you are responsible for launching ingestion jobs that write to the online store via `FeatureStore.write_to_online_store`.
+
+A `batch_source` is required for historical feature retrieval.
+
+<Warning>
+  KafkaSource is an experimental feature and may change without notice in future releases.
+</Warning>
+
+```python
+from datetime import timedelta
+
+from feast import Field, FileSource, KafkaSource
+from feast.data_format import JsonFormat
+from feast.types import Float32
+
+driver_stats_batch_source = FileSource(
+    name="driver_stats_source",
+    path="data/driver_stats.parquet",
+    timestamp_field="event_timestamp",
+)
+
+driver_stats_stream_source = KafkaSource(
+    name="driver_stats_stream",
+    kafka_bootstrap_servers="localhost:9092",
+    topic="drivers",
+    timestamp_field="event_timestamp",
+    batch_source=driver_stats_batch_source,
+    message_format=JsonFormat(
+        schema_json="driver_id integer, event_timestamp timestamp, "
+                    "conv_rate double, acc_rate double, created timestamp"
+    ),
+    watermark_delay_threshold=timedelta(minutes=5),
+)
+```
+
+Use the Kafka source in a stream feature view:
+
+```python
+from feast import stream_feature_view
+from pyspark.sql import DataFrame
+
+@stream_feature_view(
+    entities=[driver],
+    ttl=timedelta(days=1),
+    mode="spark",
+    schema=[
+        Field(name="conv_percentage", dtype=Float32),
+        Field(name="acc_percentage", dtype=Float32),
+    ],
+    timestamp_field="event_timestamp",
+    online=True,
+    source=driver_stats_stream_source,
+)
+def driver_hourly_stats_stream(df: DataFrame):
+    from pyspark.sql.functions import col
+
+    return (
+        df.withColumn("conv_percentage", col("conv_rate") * 100.0)
+          .withColumn("acc_percentage", col("acc_rate") * 100.0)
+          .drop("conv_rate", "acc_rate")
+    )
+```
+
+<ParamField path="body.kafka_bootstrap_servers" type="string" required>
+  Comma-separated list of Kafka bootstrap server addresses (e.g. `"broker1:9092,broker2:9092"`).
+</ParamField>
+
+<ParamField path="body.topic" type="string" required>
+  Kafka topic name to read from.
+</ParamField>
+
+<ParamField path="body.batch_source" type="BatchSource" required>
+  Batch source used for historical feature retrieval.
+</ParamField>
+
+<ParamField path="body.message_format" type="StreamFormat" required>
+  Message deserialization format. Use `JsonFormat(schema_json=...)` or `AvroFormat(schema_json=...)`.
+</ParamField>
+
+<ParamField path="body.timestamp_field" type="string">
+  Column name for the event timestamp in each message.
+</ParamField>
+
+<ParamField path="body.watermark_delay_threshold" type="timedelta">
+  Maximum allowed lateness for late-arriving records.
+</ParamField>
+
+</Accordion>
+
+<Accordion title="KinesisSource — Amazon Kinesis streams (experimental)">
+
+`KinesisSource` registers an Amazon Kinesis stream as a data source. Like `KafkaSource`, Feast does not manage the consumer — you provide the ingestion job.
+
+A `batch_source` is required for historical feature retrieval.
+
+<Warning>
+  KinesisSource is an experimental feature and may change without notice in future releases.
+</Warning>
+
+```python
+from datetime import timedelta
+
+from feast import Field, FileSource, KinesisSource
+from feast.data_format import JsonFormat
+from feast.types import Float32
+
+driver_stats_batch_source = FileSource(
+    name="driver_stats_source",
+    path="data/driver_stats.parquet",
+    timestamp_field="event_timestamp",
+)
+
+driver_stats_stream_source = KinesisSource(
+    name="driver_stats_stream",
+    stream_name="drivers",
+    timestamp_field="event_timestamp",
+    batch_source=driver_stats_batch_source,
+    record_format=JsonFormat(
+        schema_json="driver_id integer, event_timestamp timestamp, "
+                    "conv_rate double, acc_rate double, created timestamp"
+    ),
+    watermark_delay_threshold=timedelta(minutes=5),
+)
+```
+
+<ParamField path="body.stream_name" type="string" required>
+  Amazon Kinesis stream name.
+</ParamField>
+
+<ParamField path="body.batch_source" type="BatchSource" required>
+  Batch source for historical feature retrieval.
+</ParamField>
+
+<ParamField path="body.record_format" type="StreamFormat" required>
+  Record deserialization format. Use `JsonFormat(schema_json=...)`.
+</ParamField>
+
+<ParamField path="body.timestamp_field" type="string">
+  Column name for the event timestamp in each record.
+</ParamField>
+
+<ParamField path="body.watermark_delay_threshold" type="timedelta">
+  Maximum allowed lateness for late-arriving records.
+</ParamField>
+
+</Accordion>
+
+<Accordion title="RequestSource — on-demand features from request context">
+
+`RequestSource` provides feature values from the request payload at serving time. It is used with on-demand feature views to derive features from data passed directly in the feature retrieval call — no offline or online storage is required.
+
+```python
+from feast import RequestSource, Field
+from feast.types import Float64, Int64
+
+request_source = RequestSource(
+    name="transaction_request",
+    schema=[
+        Field(name="transaction_amount", dtype=Float64),
+        Field(name="merchant_category", dtype=Int64),
+    ],
+)
+```
+
+Use with an on-demand feature view:
+
+```python
+from feast import on_demand_feature_view
+import pandas as pd
+
+@on_demand_feature_view(
+    sources=[request_source],
+    schema=[Field(name="is_high_value", dtype=Int64)],
+)
+def transaction_features(inputs: pd.DataFrame) -> pd.DataFrame:
+    df = pd.DataFrame()
+    df["is_high_value"] = (inputs["transaction_amount"] > 1000).astype(int)
+    return df
+```
+
+<ParamField path="body.name" type="string" required>
+  Unique name for this request source.
+</ParamField>
+
+<ParamField path="body.schema" type="list[Field]" required>
+  List of `Field` objects describing the fields expected in the request payload.
+</ParamField>
+
+<Tip>
+  `RequestSource` is ideal for features that cannot be precomputed — for example, the current transaction amount used to derive risk scores at inference time.
+</Tip>
+
+</Accordion>
+
+</AccordionGroup>

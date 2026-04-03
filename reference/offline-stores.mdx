@@ -1,0 +1,701 @@
+---
+title: "Offline Stores"
+description: "Reference for all offline store backends supported by Feast, used for historical feature retrieval and model training."
+---
+
+The offline store is responsible for storing and retrieving historical feature values. It powers point-in-time correct joins for training datasets, materialization into the online store, and saved dataset exports.
+
+## Core interface
+
+Every offline store exposes the following methods:
+
+| Method | Description |
+|:--|:--|
+| `get_historical_features` | Point-in-time correct join to retrieve historical features |
+| `pull_latest_from_table_or_query` | Retrieve latest feature values for materialization |
+| `pull_all_from_table_or_query` | Retrieve a full saved dataset |
+| `offline_write_batch` | Persist dataframes to the offline store (push sources) |
+| `write_logged_features` | Persist logged features for feature logging |
+
+All retrieval methods return a `RetrievalJob` object, which supports lazy execution and multiple export targets.
+
+## Functionality matrix
+
+| | DuckDB | BigQuery | Snowflake | Redshift | Postgres | Spark | Trino | Athena |
+|:--|:--|:--|:--|:--|:--|:--|:--|:--|
+| `get_historical_features` | yes | yes | yes | yes | yes | yes | yes | yes |
+| `pull_latest_from_table_or_query` | yes | yes | yes | yes | yes | yes | yes | yes |
+| `pull_all_from_table_or_query` | yes | yes | yes | yes | yes | yes | yes | yes |
+| `offline_write_batch` | yes | yes | yes | yes | no | no | no | no |
+| `write_logged_features` | yes | yes | yes | yes | no | no | no | yes |
+
+---
+
+## Store reference
+
+<Tabs>
+
+<Tab title="File / DuckDB">
+
+### File / DuckDB offline store
+
+The DuckDB offline store is the default for local development. It reads `FileSource` data (Parquet and Delta formats) using [ibis](https://ibis-project.org/) to translate operations into DuckDB queries.
+
+**Install:**
+
+```bash
+pip install 'feast[duckdb]'
+```
+
+**Configuration:**
+
+```yaml
+project: my_project
+registry: data/registry.db
+provider: local
+offline_store:
+    type: duckdb
+online_store:
+    path: data/online_store.db
+```
+
+<ParamField path="body.type" type="string" required>
+  Must be `duckdb`.
+</ParamField>
+
+**RetrievalJob capabilities:**
+
+| Capability | Supported |
+|:--|:--|
+| Export to dataframe | yes |
+| Export to Arrow table | yes |
+| Export to Arrow batches | no |
+| Export to SQL | no |
+| Export to data lake | no |
+| Export to data warehouse | no |
+| Export as Spark dataframe | no |
+| On-demand transforms (local) | yes |
+| Persist results in offline store | yes |
+| Preview query plan | no |
+| Read partitioned data | yes |
+
+<Tip>
+  DuckDB is the recommended offline store for local development and testing. For production, use BigQuery, Snowflake, or Redshift.
+</Tip>
+
+</Tab>
+
+<Tab title="BigQuery">
+
+### BigQuery offline store
+
+The BigQuery offline store processes `BigQuerySource` data. All joins happen within BigQuery. Entity dataframes can be provided as SQL queries or Pandas dataframes — Pandas dataframes are uploaded to BigQuery as temporary tables to complete join operations.
+
+**Install:**
+
+```bash
+pip install 'feast[gcp]'
+```
+
+Initialize a new feature repo:
+
+```bash
+feast init -t gcp
+```
+
+**Configuration:**
+
+```yaml
+project: my_feature_repo
+registry: gs://my-bucket/data/registry.db
+provider: gcp
+offline_store:
+  type: bigquery
+  dataset: feast_bq_dataset
+```
+
+<ParamField path="body.type" type="string" required>
+  Must be `bigquery`.
+</ParamField>
+
+<ParamField path="body.dataset" type="string" required>
+  BigQuery dataset where Feast will create temporary tables for join operations.
+</ParamField>
+
+<ParamField path="body.project_id" type="string">
+  GCP project ID. Defaults to the project inferred from the environment.
+</ParamField>
+
+<ParamField path="body.location" type="string">
+  BigQuery dataset location (e.g. `US`, `EU`). Defaults to the dataset's location.
+</ParamField>
+
+**RetrievalJob capabilities:**
+
+| Capability | Supported |
+|:--|:--|
+| Export to dataframe | yes |
+| Export to Arrow table | yes |
+| Export to Arrow batches | no |
+| Export to SQL | yes |
+| Export to data lake | no |
+| Export to data warehouse | yes |
+| Export as Spark dataframe | no |
+| On-demand transforms (local) | yes |
+| Persist results in offline store | yes |
+| Preview query plan | yes |
+| Read partitioned data | partial\* |
+
+\* See [GitHub issue #2530](https://github.com/feast-dev/feast/issues/2530) for details on `_PARTITIONTIME` partition column support.
+
+</Tab>
+
+<Tab title="Snowflake">
+
+### Snowflake offline store
+
+The Snowflake offline store processes `SnowflakeSource` data. All joins happen within Snowflake. Pandas dataframes are uploaded as temporary tables to complete join operations.
+
+**Install:**
+
+```bash
+pip install 'feast[snowflake]'
+```
+
+If using a file-based registry, also install the relevant cloud extra:
+
+```bash
+pip install 'feast[snowflake,aws]'   # for S3 registry
+pip install 'feast[snowflake,gcp]'   # for GCS registry
+pip install 'feast[snowflake,azure]' # for Azure registry
+```
+
+Initialize a new feature repo:
+
+```bash
+feast init -t snowflake
+```
+
+**Configuration:**
+
+```yaml
+project: my_feature_repo
+registry: data/registry.db
+provider: local
+offline_store:
+  type: snowflake.offline
+  account: snowflake_deployment.us-east-1
+  user: user_login
+  password: user_password
+  role: SYSADMIN
+  warehouse: COMPUTE_WH
+  database: FEAST
+  schema: PUBLIC
+```
+
+<ParamField path="body.type" type="string" required>
+  Must be `snowflake.offline`.
+</ParamField>
+
+<ParamField path="body.account" type="string" required>
+  Snowflake account identifier (e.g. `xy12345.us-east-1`).
+</ParamField>
+
+<ParamField path="body.user" type="string" required>
+  Snowflake username.
+</ParamField>
+
+<ParamField path="body.password" type="string">
+  Snowflake password. Use environment variables or a secrets manager in production.
+</ParamField>
+
+<ParamField path="body.role" type="string">
+  Snowflake role to use for queries.
+</ParamField>
+
+<ParamField path="body.warehouse" type="string">
+  Snowflake virtual warehouse to use for compute.
+</ParamField>
+
+<ParamField path="body.database" type="string">
+  Snowflake database name.
+</ParamField>
+
+<ParamField path="body.schema" type="string">
+  Snowflake schema name.
+</ParamField>
+
+**Limitation:** Avoid single-quoted string literals in SQL queries. Use dollar-quoted strings (`$$value$$`) instead.
+
+**RetrievalJob capabilities:**
+
+| Capability | Supported |
+|:--|:--|
+| Export to dataframe | yes |
+| Export to Arrow table | yes |
+| Export to Arrow batches | yes |
+| Export to SQL | yes |
+| Export to data lake (S3, GCS) | yes |
+| Export to data warehouse | yes |
+| Export as Spark dataframe | yes |
+| On-demand transforms (local) | yes |
+| Persist results in offline store | yes |
+| Preview query plan | yes |
+| Read partitioned data | yes |
+
+</Tab>
+
+<Tab title="Redshift + Athena">
+
+### Redshift offline store
+
+The Redshift offline store processes `RedshiftSource` data. All joins happen within Redshift. Pandas dataframes are uploaded to Redshift temporarily to complete join operations.
+
+**Install:**
+
+```bash
+pip install 'feast[aws]'
+```
+
+Initialize a new feature repo:
+
+```bash
+feast init -t aws
+```
+
+**Configuration (provisioned cluster):**
+
+```yaml
+project: my_feature_repo
+registry: data/registry.db
+provider: aws
+offline_store:
+  type: redshift
+  region: us-west-2
+  cluster_id: feast-cluster
+  database: feast-database
+  user: redshift-user
+  s3_staging_location: s3://feast-bucket/redshift
+  iam_role: arn:aws:iam::123456789012:role/redshift_s3_access_role
+```
+
+**Configuration (Redshift Serverless):**
+
+```yaml
+project: my_feature_repo
+registry: data/registry.db
+provider: aws
+offline_store:
+  type: redshift
+  region: us-west-2
+  workgroup: feast-workgroup
+  database: feast-database
+  s3_staging_location: s3://feast-bucket/redshift
+  iam_role: arn:aws:iam::123456789012:role/redshift_s3_access_role
+```
+
+<ParamField path="body.type" type="string" required>
+  Must be `redshift`.
+</ParamField>
+
+<ParamField path="body.region" type="string" required>
+  AWS region where the Redshift cluster is located.
+</ParamField>
+
+<ParamField path="body.cluster_id" type="string">
+  Redshift cluster identifier. Use for provisioned clusters.
+</ParamField>
+
+<ParamField path="body.workgroup" type="string">
+  Redshift Serverless workgroup name. Use instead of `cluster_id` for serverless.
+</ParamField>
+
+<ParamField path="body.database" type="string" required>
+  Redshift database name.
+</ParamField>
+
+<ParamField path="body.user" type="string">
+  Redshift database user. Required for provisioned clusters.
+</ParamField>
+
+<ParamField path="body.s3_staging_location" type="string" required>
+  S3 URI used as a staging area for UNLOAD/COPY operations.
+</ParamField>
+
+<ParamField path="body.iam_role" type="string" required>
+  ARN of the IAM role that Redshift uses to access S3.
+</ParamField>
+
+**Required IAM permissions (Feast caller):**
+
+```json
+{
+    "Statement": [
+        {
+            "Action": [
+                "s3:ListBucket",
+                "s3:PutObject",
+                "s3:GetObject",
+                "s3:DeleteObject"
+            ],
+            "Effect": "Allow",
+            "Resource": [
+                "arn:aws:s3:::<bucket_name>/*",
+                "arn:aws:s3:::<bucket_name>"
+            ]
+        },
+        {
+            "Action": [
+                "redshift-data:DescribeTable",
+                "redshift:GetClusterCredentials",
+                "redshift-data:ExecuteStatement",
+                "redshift-data:DescribeStatement"
+            ],
+            "Effect": "Allow",
+            "Resource": "*"
+        }
+    ],
+    "Version": "2012-10-17"
+}
+```
+
+---
+
+### Athena offline store (contrib)
+
+The Athena offline store reads `AthenaSource` data via the AWS Glue Data Catalog.
+
+<Warning>
+  The Athena offline store is a community contribution and does not achieve full test coverage.
+</Warning>
+
+**Install:** `pip install 'feast[aws]'`
+
+**Configuration:**
+
+```yaml
+project: my_project
+registry: data/registry.db
+provider: local
+offline_store:
+  type: athena
+  data_source: AwsDataCatalog
+  region: us-east-1
+  database: my_database
+  workgroup: primary
+online_store:
+    path: data/online_store.db
+```
+
+<ParamField path="body.type" type="string" required>
+  Must be `athena`.
+</ParamField>
+
+<ParamField path="body.region" type="string" required>
+  AWS region for Athena queries.
+</ParamField>
+
+<ParamField path="body.database" type="string" required>
+  Athena/Glue database name.
+</ParamField>
+
+<ParamField path="body.data_source" type="string" default="AwsDataCatalog">
+  Athena data source (Glue catalog identifier).
+</ParamField>
+
+<ParamField path="body.workgroup" type="string" default="primary">
+  Athena workgroup to use for queries.
+</ParamField>
+
+</Tab>
+
+<Tab title="Spark">
+
+### Spark offline store (contrib)
+
+The Spark offline store processes `SparkSource` data. Entity dataframes can be provided as SQL queries, Pandas dataframes, or PySpark dataframes.
+
+<Warning>
+  The Spark offline store is a community contribution and does not achieve full test coverage.
+</Warning>
+
+**Install:**
+
+```bash
+pip install 'feast[spark]'
+```
+
+Initialize a new feature repo:
+
+```bash
+feast init -t spark
+```
+
+**Configuration:**
+
+```yaml
+project: my_project
+registry: data/registry.db
+provider: local
+offline_store:
+    type: spark
+    spark_conf:
+        spark.master: "local[*]"
+        spark.ui.enabled: "false"
+        spark.eventLog.enabled: "false"
+        spark.sql.catalogImplementation: "hive"
+        spark.sql.parser.quotedRegexColumnNames: "true"
+        spark.sql.session.timeZone: "UTC"
+        spark.sql.execution.arrow.fallback.enabled: "true"
+        spark.sql.execution.arrow.pyspark.enabled: "true"
+    staging_location: "s3://my-bucket/tmp/feast"
+online_store:
+    path: data/online_store.db
+```
+
+<ParamField path="body.type" type="string" required>
+  Must be `spark`.
+</ParamField>
+
+<ParamField path="body.spark_conf" type="object">
+  Dictionary of Spark configuration key-value pairs passed directly to the SparkSession.
+</ParamField>
+
+<ParamField path="body.staging_location" type="string">
+  URI (S3, GCS, Azure Blob, or local path) where large materialization outputs are spilled before being read back by Feast. Useful for large datasets that would otherwise exhaust driver memory.
+</ParamField>
+
+**RetrievalJob capabilities:**
+
+| Capability | Supported |
+|:--|:--|
+| Export to dataframe | yes |
+| Export to Arrow table | yes |
+| Export to Arrow batches | no |
+| Export to SQL | no |
+| Export to data lake (S3, GCS) | yes |
+| Export to data warehouse | no |
+| Export as Spark dataframe | yes |
+| On-demand transforms (local) | no |
+| Persist results in offline store | yes |
+| Preview query plan | yes |
+| Read partitioned data | yes |
+
+</Tab>
+
+<Tab title="Trino / Postgres / MSSQL / Oracle">
+
+### Trino offline store (contrib)
+
+The Trino offline store processes `TrinoSource` data. Entity dataframes can be provided as SQL queries or Pandas dataframes.
+
+<Warning>
+  The Trino offline store is a community contribution and does not achieve full test coverage.
+</Warning>
+
+**Install:** `pip install 'feast[trino]'`
+
+**Configuration:**
+
+```yaml
+project: feature_repo
+registry: data/registry.db
+provider: local
+offline_store:
+  type: trino
+  host: ${TRINO_HOST}
+  port: ${TRINO_PORT}
+  http-scheme: http
+  ssl-verify: false
+  catalog: hive
+  dataset: ${DATASET_NAME}
+  connector:
+    type: hive
+    file_format: parquet
+  user: trino
+  auth:
+    type: basic
+    config:
+      username: ${TRINO_USER}
+      password: ${TRINO_PWD}
+online_store:
+  path: data/online_store.db
+entity_key_serialization_version: 3
+```
+
+<ParamField path="body.host" type="string" required>
+  Trino coordinator host.
+</ParamField>
+
+<ParamField path="body.port" type="number" required>
+  Trino coordinator port.
+</ParamField>
+
+<ParamField path="body.catalog" type="string" required>
+  Trino catalog to use.
+</ParamField>
+
+<ParamField path="body.dataset" type="string" required>
+  Trino schema (dataset) name.
+</ParamField>
+
+<ParamField path="body.auth" type="object">
+  Authentication config. Supports `basic`, `certificate`, `jwt`, `oauth2`, and `kerberos`.
+</ParamField>
+
+---
+
+### PostgreSQL offline store (contrib)
+
+The PostgreSQL offline store processes `PostgreSQLSource` data. Entity dataframes can be SQL queries or Pandas dataframes.
+
+<Warning>
+  The PostgreSQL offline store is a community contribution and does not achieve full test coverage.
+</Warning>
+
+**Install:** `pip install 'feast[postgres]'`
+
+**Configuration:**
+
+```yaml
+project: my_project
+registry: data/registry.db
+provider: local
+offline_store:
+  type: postgres
+  host: DB_HOST
+  port: 5432
+  database: DB_NAME
+  db_schema: public
+  user: DB_USERNAME
+  password: DB_PASSWORD
+  sslmode: require
+  entity_select_mode: temp_table
+online_store:
+    path: data/online_store.db
+```
+
+<ParamField path="body.host" type="string" required>
+  PostgreSQL host.
+</ParamField>
+
+<ParamField path="body.port" type="number" default="5432">
+  PostgreSQL port.
+</ParamField>
+
+<ParamField path="body.database" type="string" required>
+  Database name.
+</ParamField>
+
+<ParamField path="body.db_schema" type="string" default="public">
+  PostgreSQL schema.
+</ParamField>
+
+<ParamField path="body.user" type="string" required>
+  Database user.
+</ParamField>
+
+<ParamField path="body.password" type="string">
+  Database password.
+</ParamField>
+
+<ParamField path="body.sslmode" type="string" default="require">
+  SSL mode. Options: `disable`, `require`, `verify-ca`, `verify-full`. Defaults to `require` (encrypted, no certificate verification).
+</ParamField>
+
+<ParamField path="body.entity_select_mode" type="string" default="temp_table">
+  How entity data is loaded. `temp_table` creates a temporary table; `embed_query` inlines entity SQL into a CTE for improved performance.
+</ParamField>
+
+---
+
+### MSSQL / Azure Synapse offline store (contrib)
+
+Reads from Microsoft SQL Server or Azure Synapse Analytics.
+
+<Warning>
+  The MSSQL offline store is a community contribution and does not achieve full test coverage.
+</Warning>
+
+**Install:** `pip install 'feast[azure]'`
+
+**Configuration:**
+
+```yaml
+registry:
+  registry_store_type: AzureRegistryStore
+  path: ${REGISTRY_PATH}
+project: production
+provider: azure
+online_store:
+    type: redis
+    connection_string: ${REDIS_CONN}
+offline_store:
+    type: mssql
+    connection_string: ${SQL_CONN}
+```
+
+<ParamField path="body.connection_string" type="string" required>
+  ODBC or SQLAlchemy connection string for SQL Server / Synapse.
+</ParamField>
+
+---
+
+### Oracle offline store (contrib)
+
+Reads from Oracle Database using the [ibis](https://ibis-project.org/) Oracle backend.
+
+<Warning>
+  The Oracle offline store is a community contribution and does not achieve full test coverage.
+</Warning>
+
+**Install:** `pip install 'feast[oracle]'`
+
+**Configuration:**
+
+```yaml
+project: my_project
+registry: data/registry.db
+provider: local
+offline_store:
+  type: oracle
+  host: DB_HOST
+  port: 1521
+  user: DB_USERNAME
+  password: DB_PASSWORD
+  service_name: ORCL
+online_store:
+  path: data/online_store.db
+```
+
+<ParamField path="body.host" type="string" default="localhost">
+  Oracle database host.
+</ParamField>
+
+<ParamField path="body.port" type="number" default="1521">
+  Oracle database port.
+</ParamField>
+
+<ParamField path="body.user" type="string" required>
+  Oracle database user.
+</ParamField>
+
+<ParamField path="body.password" type="string" required>
+  Oracle database password.
+</ParamField>
+
+<ParamField path="body.service_name" type="string">
+  Oracle service name. Mutually exclusive with `sid` and `dsn`.
+</ParamField>
+
+<ParamField path="body.sid" type="string">
+  Oracle SID. Mutually exclusive with `service_name` and `dsn`.
+</ParamField>
+
+<ParamField path="body.dsn" type="string">
+  Full Oracle DSN connection string. Mutually exclusive with `service_name` and `sid`.
+</ParamField>
+
+</Tab>
+
+</Tabs>

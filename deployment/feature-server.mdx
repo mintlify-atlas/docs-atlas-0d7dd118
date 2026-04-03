@@ -1,0 +1,419 @@
+---
+title: "Feature Server"
+description: "Deploy the Feast feature server for online feature retrieval. Covers the Python feature server, REST API endpoints, authentication, Docker deployment, and Prometheus metrics."
+---
+
+The Feast feature server is a REST API server built on [FastAPI](https://fastapi.tiangolo.com/) that provides low-latency online feature retrieval over HTTP/JSON. It enables any application — regardless of language — to fetch pre-materialized features from the online store.
+
+## Overview
+
+<CardGroup cols={2}>
+  <Card title="REST API" icon="code">
+    Serves features over HTTP/JSON — integrate from any language
+  </Card>
+  <Card title="Push support" icon="arrow-up">
+    Push fresh feature values directly to the online and/or offline store
+  </Card>
+  <Card title="Materialization" icon="database">
+    Trigger materialization jobs via REST endpoint
+  </Card>
+  <Card title="TLS support" icon="lock">
+    Run in TLS mode for encrypted production traffic
+  </Card>
+</CardGroup>
+
+## Starting the feature server
+
+### CLI
+
+Start the server with a single command from inside your feature repository:
+
+```bash
+feast serve
+```
+
+The server starts on port `6566` by default:
+
+```
+INFO: Uvicorn running on http://127.0.0.1:6566 (Press CTRL+C to quit)
+```
+
+### CLI options
+
+| Flag | Description | Default |
+|---|---|---|
+| `--host` / `-h` | Bind host address | `127.0.0.1` |
+| `--port` / `-p` | Listen port | `6566` |
+| `--workers` / `-w` | Number of worker processes. Use `-1` to auto-calculate (2 × CPU + 1) | `1` |
+| `--worker-connections` | Max simultaneous clients per worker | `1000` |
+| `--max-requests` | Max requests per worker before restart (prevents memory leaks) | `1000` |
+| `--max-requests-jitter` | Jitter for staggered worker restarts | `50` |
+| `--registry_ttl_sec` / `-r` | Registry refresh interval in seconds | `60` |
+| `--keep-alive-timeout` | Keep-alive connection timeout in seconds | `30` |
+| `--key` | Path to TLS private key (enables TLS mode) | — |
+| `--cert` | Path to TLS certificate (enables TLS mode) | — |
+| `--metrics` | Enable Prometheus metrics on port 8000 | — |
+
+### Production startup example
+
+```bash
+# Auto-scale workers, 1000 connections each, 60s registry TTL
+feast serve \
+  --host 0.0.0.0 \
+  --workers -1 \
+  --worker-connections 1000 \
+  --registry_ttl_sec 60
+```
+
+---
+
+## Full initialization example
+
+```bash
+# 1. Create a new feature repository
+feast init feature_repo
+cd feature_repo
+
+# 2. Apply feature definitions to create infrastructure
+feast apply
+
+# 3. Materialize features into the online store
+feast materialize-incremental $(date -u +"%Y-%m-%dT%H:%M:%S")
+
+# 4. Start the feature server
+feast serve
+```
+
+---
+
+## REST API endpoints
+
+### GET `/` — Health check
+
+Returns server status. Use this endpoint for Kubernetes liveness and readiness probes.
+
+```bash
+curl http://localhost:6566/
+```
+
+### POST `/get-online-features` — Retrieve online features
+
+Fetch feature values for a list of entities from the online store.
+
+**Request with explicit feature references:**
+
+```bash
+curl -X POST "http://localhost:6566/get-online-features" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "features": [
+      "driver_hourly_stats:conv_rate",
+      "driver_hourly_stats:acc_rate",
+      "driver_hourly_stats:avg_daily_trips"
+    ],
+    "entities": {
+      "driver_id": [1001, 1002, 1003]
+    }
+  }'
+```
+
+**Request using a feature service:**
+
+```bash
+curl -X POST "http://localhost:6566/get-online-features" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "feature_service": "driver_activity_v1",
+    "entities": {
+      "driver_id": [1001, 1002, 1003]
+    }
+  }'
+```
+
+**Response:**
+
+```json
+{
+  "metadata": {
+    "feature_names": ["driver_id", "conv_rate", "avg_daily_trips", "acc_rate"]
+  },
+  "results": [
+    {
+      "values": [1001, 0.7037, 308, 0.8724],
+      "statuses": ["PRESENT", "PRESENT", "PRESENT", "PRESENT"],
+      "event_timestamps": [
+        "1970-01-01T00:00:00Z",
+        "2021-12-31T23:00:00Z",
+        "2021-12-31T23:00:00Z",
+        "2021-12-31T23:00:00Z"
+      ]
+    }
+  ]
+}
+```
+
+### POST `/push` — Push features to the store
+
+Push feature values directly to the online store, offline store, or both. Useful for real-time feature updates without running a full materialization job.
+
+The `to` parameter controls the write target: `"online"`, `"offline"`, or `"online_and_offline"`.
+
+```bash
+curl -X POST "http://localhost:6566/push" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "push_source_name": "driver_stats_push_source",
+    "df": {
+      "driver_id": [1001],
+      "event_timestamp": ["2022-05-13T10:59:42+00:00"],
+      "created": ["2022-05-13T10:59:42"],
+      "conv_rate": [1.0],
+      "acc_rate": [1.0],
+      "avg_daily_trips": [1000]
+    },
+    "to": "online_and_offline"
+  }'
+```
+
+**Offline write batching** can be enabled in `feature_store.yaml` to buffer writes and reduce load on the offline store:
+
+```yaml
+feature_server:
+  type: local
+  offline_push_batching_enabled: true
+  offline_push_batching_batch_size: 1000
+  offline_push_batching_batch_interval_seconds: 10
+```
+
+### POST `/materialize` — Materialize features
+
+Trigger a materialization job from the offline store to the online store for a specific time range:
+
+```bash
+curl -X POST "http://localhost:6566/materialize" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start_ts": "2021-01-01T00:00:00",
+    "end_ts": "2021-01-02T00:00:00",
+    "feature_views": ["driver_hourly_stats"]
+  }'
+```
+
+To materialize all data without timestamp filtering:
+
+```bash
+curl -X POST "http://localhost:6566/materialize" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "feature_views": ["driver_hourly_stats"],
+    "disable_event_timestamp": true
+  }'
+```
+
+### POST `/materialize-incremental` — Incremental materialization
+
+Materialize only new data since the last run, up to the provided timestamp:
+
+```bash
+curl -X POST "http://localhost:6566/materialize-incremental" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "end_ts": "2021-01-02T00:00:00"
+  }'
+```
+
+### GET `/docs` — Interactive API documentation
+
+Swagger UI is available at `/docs` for exploring and testing all endpoints.
+
+---
+
+## Endpoint permissions summary
+
+| Endpoint | Resource type | Permission required |
+|---|---|---|
+| `/get-online-features` | FeatureView, OnDemandFeatureView | Read Online |
+| `/retrieve-online-documents` | FeatureView | Read Online |
+| `/push` | FeatureView | Write Online / Write Offline / Both |
+| `/write-to-online-store` | FeatureView | Write Online |
+| `/materialize` | FeatureView | Write Online |
+| `/materialize-incremental` | FeatureView | Write Online |
+
+---
+
+## TLS mode
+
+Run the feature server with TLS to encrypt all client-server communication.
+
+**Generate a self-signed certificate (development only):**
+
+```bash
+openssl req -x509 -newkey rsa:2048 \
+  -keyout key.pem -out cert.pem \
+  -days 365 -nodes
+```
+
+**Start with TLS enabled:**
+
+```bash
+feast serve --key /path/to/key.pem --cert /path/to/cert.pem
+```
+
+The server now listens on `https://`:
+
+```
+[INFO] Listening at: https://127.0.0.1:6566
+```
+
+**Client configuration for TLS:**
+
+```yaml
+# feature_store.yaml (client)
+project: feast-project
+provider: local
+registry: /path/to/registry.db
+online_store:
+  type: remote
+  path: https://localhost:6566
+  cert: /path/to/cert.pem
+auth:
+  type: no_auth
+```
+
+<Tip>
+  In production, add the server certificate to your system's CA trust store and set `FEAST_CA_CERT_FILE_PATH` to the trust store path. Feast uses it automatically — no per-client `cert` config needed.
+</Tip>
+
+---
+
+## Docker deployment
+
+The official Feast feature server Docker image is published to [quay.io/feastdev/feature-server](https://quay.io/repository/feastdev/feature-server).
+
+**Run the container:**
+
+```bash
+# Encode your feature_store.yaml
+export FEATURE_STORE_YAML_BASE64=$(base64 < feature_store.yaml)
+
+docker run -p 6566:6566 \
+  -e FEATURE_STORE_YAML_BASE64="${FEATURE_STORE_YAML_BASE64}" \
+  quay.io/feastdev/feature-server:0.61.0 \
+  feast serve -h 0.0.0.0
+```
+
+**Docker Compose example:**
+
+```yaml
+# docker-compose.yml
+version: "3.9"
+services:
+  feast-server:
+    image: quay.io/feastdev/feature-server:0.61.0
+    ports:
+      - "6566:6566"
+    environment:
+      FEATURE_STORE_YAML_BASE64: "${FEATURE_STORE_YAML_BASE64}"
+    command: ["feast", "serve", "-h", "0.0.0.0"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6566/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+```
+
+---
+
+## Prometheus metrics
+
+The feature server can expose Prometheus-compatible metrics on port `8000`. Metrics are opt-in and have zero overhead when disabled.
+
+**Enable via CLI:**
+
+```bash
+feast serve --metrics
+```
+
+**Enable in `feature_store.yaml`:**
+
+```yaml
+feature_server:
+  type: local
+  metrics:
+    enabled: true
+    resource: true          # CPU / memory gauges
+    request: true           # endpoint latency & request counters
+    online_features: true   # online feature retrieval counters
+    push: true              # push request counters
+    materialization: true   # materialization counters & duration
+    freshness: true         # feature freshness gauges
+```
+
+**Key metrics:**
+
+| Metric | Type | Description |
+|---|---|---|
+| `feast_feature_server_request_total` | Counter | Total requests per endpoint and status |
+| `feast_feature_server_request_latency_seconds` | Histogram | Request latency (p50/p95/p99) |
+| `feast_online_features_request_total` | Counter | Total online feature retrieval requests |
+| `feast_feature_freshness_seconds` | Gauge | Seconds since last materialization per feature view |
+| `feast_materialization_duration_seconds` | Histogram | Materialization duration per feature view |
+| `feast_push_request_total` | Counter | Push requests by source and mode |
+
+**Prometheus scrape config:**
+
+```yaml
+scrape_configs:
+  - job_name: feast
+    static_configs:
+      - targets: ["localhost:8000"]
+```
+
+**Kubernetes / Feast Operator** — enable metrics in the `FeatureStore` CR:
+
+```yaml
+spec:
+  services:
+    onlineStore:
+      server:
+        metrics: true
+```
+
+The operator exposes port `8000` and creates a corresponding `Service` port automatically.
+
+---
+
+## feature_store.yaml: feature_server block
+
+```yaml
+feature_server:
+  type: local
+  metrics:
+    enabled: true
+    resource: true
+    request: true
+    online_features: true
+    push: true
+    materialization: true
+    freshness: true
+  offline_push_batching_enabled: true
+  offline_push_batching_batch_size: 1000
+  offline_push_batching_batch_interval_seconds: 10
+```
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Kubernetes Deployment" icon="docker" href="/deployment/kubernetes">
+    Deploy the feature server on Kubernetes with the Feast Operator or Helm
+  </Card>
+  <Card title="Local Deployment" icon="laptop" href="/deployment/local">
+    Run the feature server locally for development
+  </Card>
+  <Card title="Cloud Providers" icon="cloud" href="/deployment/cloud-providers">
+    Configure AWS, GCP, or Azure as the backend for your feature store
+  </Card>
+</CardGroup>

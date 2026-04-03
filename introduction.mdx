@@ -1,0 +1,103 @@
+---
+title: "Welcome to Feast"
+description: "The open source feature store for AI/ML — manage, serve, and discover features for model training and real-time inference."
+---
+
+Feast (**Fea**ture **St**ore) is an open source feature store for machine learning. It is the fastest path to manage existing infrastructure to productionize analytic data for model training and online inference.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Deploy a local feature store and serve your first features in minutes.
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/architecture">
+    Understand how Feast components fit together end to end.
+  </Card>
+  <Card title="Concepts" icon="book" href="/concepts/feature-views">
+    Learn the core abstractions: feature views, entities, data sources, and more.
+  </Card>
+  <Card title="SDK API Reference" icon="code" href="/reference/feature-store-api">
+    Full reference for the Python SDK public API surface.
+  </Card>
+</CardGroup>
+
+## What Feast does
+
+Feast solves three core problems for ML platform teams:
+
+**Training-serving consistency** — Feast manages an offline store for historical feature retrieval and an online store for low-latency inference, ensuring the same feature logic powers both training and serving.
+
+**Point-in-time correctness** — When generating training datasets, Feast joins features using point-in-time logic so future values never leak into your model's training data.
+
+**Infrastructure decoupling** — Feast abstracts feature storage and retrieval so your models remain portable across data infrastructure changes — from batch to real-time, from one cloud to another.
+
+## Who uses Feast
+
+<CardGroup cols={2}>
+  <Card title="Data Scientists" icon="flask">
+    Define, store, and retrieve features for both model development and deployment without worrying about infrastructure.
+  </Card>
+  <Card title="MLOps Engineers" icon="gears">
+    Connect existing infrastructure — databases, warehouses, streaming systems — and expose a consistent SDK to your data science team.
+  </Card>
+  <Card title="Data Engineers" icon="database">
+    Maintain a centralized feature catalog with a single source of truth, and abstract reads/writes across offline and online stores.
+  </Card>
+  <Card title="AI Engineers" icon="brain">
+    Build RAG pipelines and GenAI applications with vector database integrations and embedding management.
+  </Card>
+</CardGroup>
+
+## Get started
+
+<Steps>
+  <Step title="Install Feast">
+    ```bash
+    pip install feast
+    ```
+  </Step>
+  <Step title="Create a feature repository">
+    ```bash
+    feast init my_feature_repo
+    cd my_feature_repo/feature_repo
+    ```
+  </Step>
+  <Step title="Apply your feature definitions">
+    ```bash
+    feast apply
+    ```
+  </Step>
+  <Step title="Retrieve features">
+    ```python
+    from feast import FeatureStore
+
+    store = FeatureStore(repo_path=".")
+    features = store.get_online_features(
+        features=["driver_hourly_stats:conv_rate"],
+        entity_rows=[{"driver_id": 1001}],
+    ).to_dict()
+    ```
+  </Step>
+</Steps>
+
+## Key capabilities
+
+<CardGroup cols={2}>
+  <Card title="Offline & Online Stores" icon="server" href="/concepts/offline-online-stores">
+    Support for BigQuery, Snowflake, Redshift, DuckDB, Redis, DynamoDB, Bigtable, and many more.
+  </Card>
+  <Card title="Materialization" icon="arrows-rotate" href="/guides/materialization">
+    Batch-ingest features from offline stores into online stores for low-latency serving.
+  </Card>
+  <Card title="Streaming Features" icon="bolt" href="/concepts/feature-retrieval">
+    Push real-time features via Kafka, Kinesis, or the Push API.
+  </Card>
+  <Card title="GenAI & Vector Search" icon="magnifying-glass" href="/concepts/genai-and-vectors">
+    Store embeddings and run vector similarity search for RAG applications.
+  </Card>
+  <Card title="Feature Transformations" icon="wand-magic-sparkles" href="/guides/feature-transformation">
+    Apply on-demand transformations at retrieval time without duplicating logic.
+  </Card>
+  <Card title="CLI & Web UI" icon="terminal" href="/reference/cli">
+    Manage your feature store from the command line or explore features visually in the browser.
+  </Card>
+</CardGroup>

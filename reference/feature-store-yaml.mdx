@@ -1,0 +1,732 @@
+---
+title: "feature_store.yaml"
+description: "Complete reference for all fields in the Feast feature_store.yaml configuration file."
+---
+
+`feature_store.yaml` is placed at the root of your feature repository and defines how the feature store runs: which provider to use, where the registry lives, and how online and offline stores are configured.
+
+**Minimal example**
+
+```yaml
+project: my_feature_repo
+registry: data/registry.db
+provider: local
+online_store:
+  type: sqlite
+  path: data/online_store.db
+```
+
+---
+
+## Top-level fields
+
+<ParamField path="project" type="string" required>
+  Unique identifier for this feature store deployment. Used to namespace all objects in the registry and the online store.
+
+  - Alphanumeric characters, underscores, and hyphens are allowed.
+  - Must not start with an underscore or hyphen.
+  - Project names cannot contain hyphens when using the SQLite online store, because the name is used in table names.
+
+  ```yaml
+  project: driver_ranking_v1
+  ```
+</ParamField>
+
+<ParamField path="provider" type="string" default="local">
+  Defines the execution environment and determines default values for other fields.
+
+  | Value | Offline store default | Online store default |
+  |---|---|---|
+  | `local` | Dask (local Parquet files) | SQLite |
+  | `gcp` | BigQuery | Datastore |
+  | `aws` | Redshift | DynamoDB |
+
+  ```yaml
+  provider: local
+  ```
+</ParamField>
+
+<ParamField path="registry" type="string or object" default="data/registry.db">
+  Location of the feature registry. Accepts a file path string or a structured registry configuration object.
+
+  ```yaml
+  # Simple file path (local or remote)
+  registry: data/registry.db
+
+  # GCS path
+  registry: gs://my-bucket/feast/registry.db
+
+  # S3 path
+  registry: s3://my-bucket/feast/registry.db
+  ```
+
+  For SQL-based or Snowflake registries, provide a full configuration object (see [Registry configuration](#registry-configuration) below).
+</ParamField>
+
+<ParamField path="online_store" type="object">
+  Configures the online store used for low-latency feature serving. See [Online store configuration](#online-store-configuration) below.
+</ParamField>
+
+<ParamField path="offline_store" type="object">
+  Configures the offline store used for historical feature retrieval and training data generation. See [Offline store configuration](#offline-store-configuration) below.
+</ParamField>
+
+<ParamField path="batch_engine" type="string or object" default="local">
+  Configures the batch materialization engine. Supported values: `local`, `snowflake.engine`, `lambda`, `k8s`, `spark.engine`, `ray.engine`.
+
+  ```yaml
+  batch_engine: local
+  ```
+</ParamField>
+
+<ParamField path="entity_key_serialization_version" type="integer" default="3">
+  Controls the serialization scheme used when writing entity keys to the online store.
+
+  - `3` — Current default. Includes entity key value length in serialized bytes, enabling deserialization and document retrieval use cases. Supported since Feast 0.38.
+  - Values below `3` are deprecated and will emit a warning.
+
+  ```yaml
+  entity_key_serialization_version: 3
+  ```
+</ParamField>
+
+<ParamField path="coerce_tz_aware" type="boolean" default="true">
+  If `true`, entity DataFrame timestamp columns are coerced to be timezone-aware (UTC by default).
+</ParamField>
+
+<ParamField path="project_description" type="string">
+  Optional human-readable description of the project.
+
+  ```yaml
+  project_description: "Feature store for driver ranking model"
+  ```
+</ParamField>
+
+<ParamField path="flags" type="object">
+  Feature flags for experimental features. This field is deprecated; experimental features now log warnings directly.
+</ParamField>
+
+---
+
+## Registry configuration
+
+The `registry` field can be a simple path string or a structured object with additional options.
+
+<ParamField path="registry_type" type="string" default="file">
+  Type of registry backend. Accepted values: `file`, `sql`, `snowflake.registry`, `remote`.
+</ParamField>
+
+<ParamField path="path" type="string">
+  Path to the registry. For `file` type: a local path or remote object storage URI (GCS, S3). For `sql` type: a SQLAlchemy connection URL.
+</ParamField>
+
+<ParamField path="cache_ttl_seconds" type="integer" default="600">
+  How long (in seconds) registry state is cached in memory. Set to `0` for an infinite cache that is never automatically refreshed. Call `feature_store.refresh_registry()` to refresh manually.
+</ParamField>
+
+<ParamField path="cache_mode" type="string" default="sync">
+  Cache refresh strategy.
+  - `sync` — Registry is refreshed immediately after each write. Changes are visible instantly.
+  - `thread` — Registry is refreshed asynchronously in the background at `cache_ttl_seconds` intervals. Changes may take up to `cache_ttl_seconds` to appear.
+</ParamField>
+
+<ParamField path="s3_additional_kwargs" type="object">
+  Extra keyword arguments passed to `boto3` when writing the registry file to S3 (e.g., `ServerSideEncryption`, `ACL`).
+</ParamField>
+
+<ParamField path="purge_feast_metadata" type="boolean" default="false">
+  Stops using the `feast_metadata` table and deletes its data. Once set to `true`, this cannot be safely reverted.
+</ParamField>
+
+<ParamField path="enable_online_feature_view_versioning" type="boolean" default="false">
+  When `true`, each feature view schema version gets its own online store table. Enables version-qualified reads such as `fv@v2:feature`. Version history tracking in the registry is always active regardless of this setting.
+</ParamField>
+
+**Examples**
+
+<CodeGroup>
+
+```yaml SQL registry
+registry:
+  registry_type: sql
+  path: postgresql+psycopg://user:password@localhost:5432/feast_registry
+  cache_ttl_seconds: 60
+  cache_mode: thread
+```
+
+```yaml Snowflake registry
+registry:
+  registry_type: snowflake.registry
+  account: myaccount
+  user: myuser
+  password: mypassword
+  role: myrole
+  warehouse: mywarehouse
+  database: feast
+  schema: public
+```
+
+```yaml Remote registry
+registry:
+  registry_type: remote
+  path: localhost:6570
+```
+
+</CodeGroup>
+
+---
+
+## Online store configuration
+
+Set `online_store.type` to select the backend. Additional fields vary by store type.
+
+<Tabs>
+  <Tab title="SQLite (local)">
+    Default for the `local` provider. Best for development and testing.
+
+    ```yaml
+    online_store:
+      type: sqlite
+      path: data/online_store.db
+    ```
+
+    <ParamField path="path" type="string" default="data/online_store.db">
+      File path for the SQLite database.
+    </ParamField>
+  </Tab>
+
+  <Tab title="Redis">
+    ```yaml
+    online_store:
+      type: redis
+      connection_string: "localhost:6379"
+    ```
+
+    <ParamField path="connection_string" type="string" required>
+      Redis connection string, e.g. `localhost:6379` or `redis://user:pass@host:6379/0`.
+    </ParamField>
+  </Tab>
+
+  <Tab title="DynamoDB (AWS)">
+    Default for the `aws` provider.
+
+    ```yaml
+    online_store:
+      type: dynamodb
+      region: us-east-1
+    ```
+
+    <ParamField path="region" type="string" required>
+      AWS region, e.g. `us-east-1`.
+    </ParamField>
+
+    <ParamField path="table_name_template" type="string" default="{project}.{table_name}">
+      Template for DynamoDB table names.
+    </ParamField>
+  </Tab>
+
+  <Tab title="Datastore (GCP)">
+    Default for the `gcp` provider.
+
+    ```yaml
+    online_store:
+      type: datastore
+      project_id: my-gcp-project
+    ```
+
+    <ParamField path="project_id" type="string">
+      GCP project ID. If omitted, Feast uses the default project from the local environment.
+    </ParamField>
+
+    <ParamField path="namespace" type="string" default="feast">
+      Datastore namespace to use.
+    </ParamField>
+  </Tab>
+
+  <Tab title="Bigtable (GCP)">
+    ```yaml
+    online_store:
+      type: bigtable
+      project_id: my-gcp-project
+      instance: feast-instance
+    ```
+
+    <ParamField path="project_id" type="string" required>
+      GCP project ID.
+    </ParamField>
+
+    <ParamField path="instance" type="string" required>
+      Bigtable instance ID.
+    </ParamField>
+  </Tab>
+
+  <Tab title="PostgreSQL">
+    ```yaml
+    online_store:
+      type: postgres
+      host: localhost
+      port: 5432
+      database: feast
+      user: feast_user
+      password: feast_password
+    ```
+
+    <ParamField path="host" type="string" default="localhost">
+      PostgreSQL host.
+    </ParamField>
+
+    <ParamField path="port" type="integer" default="5432">
+      PostgreSQL port.
+    </ParamField>
+
+    <ParamField path="database" type="string" default="feast">
+      Database name.
+    </ParamField>
+
+    <ParamField path="user" type="string" required>
+      Database username.
+    </ParamField>
+
+    <ParamField path="password" type="string" required>
+      Database password.
+    </ParamField>
+  </Tab>
+
+  <Tab title="Snowflake">
+    ```yaml
+    online_store:
+      type: snowflake.online
+      account: myaccount
+      user: myuser
+      password: mypassword
+      role: myrole
+      warehouse: mywarehouse
+      database: feast
+      schema: public
+    ```
+  </Tab>
+
+  <Tab title="Other stores">
+    Feast also supports the following online store types:
+
+    | Type | Description |
+    |---|---|
+    | `cassandra` | Apache Cassandra |
+    | `mysql` | MySQL |
+    | `hbase` | Apache HBase |
+    | `hazelcast` | Hazelcast |
+    | `elasticsearch` | Elasticsearch |
+    | `singlestore` | SingleStore |
+    | `qdrant` | Qdrant (vector store) |
+    | `milvus` | Milvus (vector store) |
+    | `mongodb` | MongoDB |
+    | `couchbase.online` | Couchbase |
+    | `remote` | Remote online store server |
+    | `hybrid` | Hybrid online store |
+
+    Each store type accepts its own connection parameters. Refer to the individual store documentation for details.
+  </Tab>
+</Tabs>
+
+---
+
+## Offline store configuration
+
+Set `offline_store.type` to select the backend.
+
+<Tabs>
+  <Tab title="Dask (local)">
+    Default offline store. Reads local Parquet files using Dask.
+
+    ```yaml
+    offline_store:
+      type: dask
+    ```
+
+    <Note>
+      `file` is an alias for `dask` and both resolve to `DaskOfflineStore`.
+    </Note>
+  </Tab>
+
+  <Tab title="BigQuery (GCP)">
+    ```yaml
+    offline_store:
+      type: bigquery
+      project: my-gcp-project
+      dataset: feast_dataset
+    ```
+
+    <ParamField path="project" type="string">
+      GCP project ID.
+    </ParamField>
+
+    <ParamField path="dataset" type="string" required>
+      BigQuery dataset for staging tables created by Feast during point-in-time joins.
+    </ParamField>
+  </Tab>
+
+  <Tab title="Redshift (AWS)">
+    ```yaml
+    offline_store:
+      type: redshift
+      region: us-east-1
+      cluster_id: my-redshift-cluster
+      database: feast
+      user: feast_user
+      s3_staging_location: s3://my-bucket/feast/staging
+      iam_role: arn:aws:iam::123456789012:role/FeastRedshiftRole
+    ```
+
+    <ParamField path="region" type="string" required>
+      AWS region.
+    </ParamField>
+
+    <ParamField path="cluster_id" type="string">
+      Redshift cluster identifier. One of `cluster_id` or `workgroup_name` must be provided.
+    </ParamField>
+
+    <ParamField path="database" type="string" required>
+      Redshift database name.
+    </ParamField>
+
+    <ParamField path="s3_staging_location" type="string" required>
+      S3 URI used as a staging area for Redshift UNLOAD operations.
+    </ParamField>
+
+    <ParamField path="iam_role" type="string" required>
+      IAM role ARN that Redshift uses to access S3.
+    </ParamField>
+  </Tab>
+
+  <Tab title="Snowflake">
+    ```yaml
+    offline_store:
+      type: snowflake.offline
+      account: myaccount
+      user: myuser
+      password: mypassword
+      role: myrole
+      warehouse: mywarehouse
+      database: feast
+      schema: public
+    ```
+  </Tab>
+
+  <Tab title="DuckDB">
+    ```yaml
+    offline_store:
+      type: duckdb
+    ```
+
+    A fast in-process offline store suitable for local development and testing.
+  </Tab>
+
+  <Tab title="Other stores">
+    Feast also supports the following offline store types via contrib modules:
+
+    | Type | Description |
+    |---|---|
+    | `spark` | Apache Spark |
+    | `trino` | Trino |
+    | `postgres` | PostgreSQL |
+    | `athena` | Amazon Athena |
+    | `mssql` | Microsoft SQL Server |
+    | `clickhouse` | ClickHouse |
+    | `ray` | Ray |
+    | `oracle` | Oracle |
+    | `couchbase.offline` | Couchbase Columnar |
+    | `remote` | Remote offline store server |
+
+    Each store accepts its own configuration parameters. Refer to the individual store documentation for details.
+  </Tab>
+</Tabs>
+
+---
+
+## Feature server configuration
+
+The `feature_server` block configures the Python Feature Server when it is used to serve online features or handle `/push` requests. This block is optional.
+
+```yaml
+feature_server:
+  type: local
+  metrics:
+    enabled: true
+    resource: true
+    request: true
+    online_features: true
+    push: true
+    materialization: true
+    freshness: true
+  offline_push_batching_enabled: true
+  offline_push_batching_batch_size: 100
+  offline_push_batching_batch_interval_seconds: 5
+```
+
+<ParamField path="type" type="string" default="local">
+  Feature server type. Accepted values: `local`, `mcp`.
+</ParamField>
+
+<ParamField path="metrics.enabled" type="boolean" default="false">
+  Enable a Prometheus metrics server on port 8000.
+</ParamField>
+
+<ParamField path="metrics.resource" type="boolean" default="false">
+  Expose CPU and memory gauges.
+</ParamField>
+
+<ParamField path="metrics.request" type="boolean" default="false">
+  Expose endpoint latency histograms and request counters.
+</ParamField>
+
+<ParamField path="metrics.online_features" type="boolean" default="false">
+  Expose online feature retrieval counters, store read timing, and ODFV transform timing.
+</ParamField>
+
+<ParamField path="metrics.push" type="boolean" default="false">
+  Expose push request counters.
+</ParamField>
+
+<ParamField path="metrics.materialization" type="boolean" default="false">
+  Expose materialization counters and duration histograms.
+</ParamField>
+
+<ParamField path="metrics.freshness" type="boolean" default="false">
+  Expose per-feature-view freshness gauges.
+</ParamField>
+
+<ParamField path="offline_push_batching_enabled" type="boolean" default="false">
+  Enable batching of offline writes processed by `/push`. Online writes are not affected.
+</ParamField>
+
+<ParamField path="offline_push_batching_batch_size" type="integer" default="100">
+  Maximum number of buffered rows before Feast flushes a batch to the offline store.
+</ParamField>
+
+<ParamField path="offline_push_batching_batch_interval_seconds" type="integer" default="5">
+  Maximum time (in seconds) rows may remain buffered before a forced flush.
+</ParamField>
+
+---
+
+## Authentication and authorization
+
+The `auth` block configures how Feast authenticates requests to the feature server and registry.
+
+<ParamField path="auth.type" type="string" default="no_auth">
+  Authentication type. Accepted values: `no_auth`, `kubernetes`, `oidc`.
+</ParamField>
+
+**No authentication (default)**
+
+```yaml
+auth:
+  type: no_auth
+```
+
+**Kubernetes authentication**
+
+Uses Kubernetes service account tokens for authentication.
+
+```yaml
+auth:
+  type: kubernetes
+```
+
+**OIDC (server-side)**
+
+Validates tokens from an external OIDC provider.
+
+```yaml
+auth:
+  type: oidc
+  client_id: feast-client
+  auth_discovery_url: https://auth.example.com/realms/feast/.well-known/openid-configuration
+```
+
+<ParamField path="auth.client_id" type="string">
+  OIDC client ID registered with the identity provider.
+</ParamField>
+
+<ParamField path="auth.auth_discovery_url" type="string">
+  URL for the OIDC discovery document (`.well-known/openid-configuration`).
+</ParamField>
+
+**OIDC client credentials**
+
+Used when the feature store client itself needs to authenticate to a remote registry or feature server.
+
+```yaml
+auth:
+  type: oidc
+  client_id: feast-client
+  client_secret: my-secret
+  auth_discovery_url: https://auth.example.com/realms/feast/.well-known/openid-configuration
+```
+
+---
+
+## Materialization configuration
+
+<ParamField path="materialization.pull_latest_features" type="boolean" default="false">
+  If `true`, materialization jobs pull only the latest feature value per entity within the specified time range rather than all values.
+
+  ```yaml
+  materialization:
+    pull_latest_features: true
+  ```
+</ParamField>
+
+---
+
+## OpenLineage configuration
+
+Feast can emit [OpenLineage](https://openlineage.io/) events during `feast apply` and materialization for data lineage tracking.
+
+```yaml
+openlineage:
+  enabled: true
+  transport_type: http
+  transport_url: http://localhost:5000
+  transport_endpoint: api/v1/lineage
+  namespace: feast
+```
+
+<ParamField path="openlineage.enabled" type="boolean" default="false">
+  Enable OpenLineage integration.
+</ParamField>
+
+<ParamField path="openlineage.transport_type" type="string" default="console">
+  Transport backend. Accepted values: `http`, `console`, `file`, `kafka`.
+</ParamField>
+
+<ParamField path="openlineage.transport_url" type="string">
+  URL for the HTTP transport backend. Required when `transport_type` is `http`.
+</ParamField>
+
+<ParamField path="openlineage.transport_endpoint" type="string" default="api/v1/lineage">
+  API endpoint path for HTTP transport.
+</ParamField>
+
+<ParamField path="openlineage.api_key" type="string">
+  Optional API key for authenticating with the lineage server.
+</ParamField>
+
+<ParamField path="openlineage.namespace" type="string" default="feast">
+  Default namespace for Feast jobs and datasets in lineage events.
+</ParamField>
+
+<ParamField path="openlineage.emit_on_apply" type="boolean" default="true">
+  Emit lineage events when `feast apply` runs.
+</ParamField>
+
+<ParamField path="openlineage.emit_on_materialize" type="boolean" default="true">
+  Emit lineage events during materialization.
+</ParamField>
+
+---
+
+## Complete examples
+
+<Tabs>
+  <Tab title="Local development">
+    ```yaml
+    project: my_local_project
+    provider: local
+    registry: data/registry.db
+    online_store:
+      type: sqlite
+      path: data/online_store.db
+    offline_store:
+      type: dask
+    entity_key_serialization_version: 3
+    auth:
+      type: no_auth
+    ```
+  </Tab>
+
+  <Tab title="AWS">
+    ```yaml
+    project: my_aws_project
+    provider: aws
+    registry:
+      registry_type: file
+      path: s3://my-feast-bucket/registry/registry.db
+      s3_additional_kwargs:
+        ServerSideEncryption: AES256
+    online_store:
+      type: dynamodb
+      region: us-east-1
+    offline_store:
+      type: redshift
+      region: us-east-1
+      cluster_id: my-redshift-cluster
+      database: feast
+      user: feast_user
+      s3_staging_location: s3://my-feast-bucket/staging
+      iam_role: arn:aws:iam::123456789012:role/FeastRedshiftRole
+    batch_engine: local
+    entity_key_serialization_version: 3
+    auth:
+      type: no_auth
+    ```
+  </Tab>
+
+  <Tab title="GCP">
+    ```yaml
+    project: my_gcp_project
+    provider: gcp
+    registry:
+      registry_type: file
+      path: gs://my-feast-bucket/registry/registry.db
+      cache_ttl_seconds: 60
+    online_store:
+      type: datastore
+      project_id: my-gcp-project
+    offline_store:
+      type: bigquery
+      project: my-gcp-project
+      dataset: feast_staging
+    entity_key_serialization_version: 3
+    auth:
+      type: no_auth
+    ```
+  </Tab>
+
+  <Tab title="Production with auth">
+    ```yaml
+    project: prod_driver_features
+    provider: aws
+    registry:
+      registry_type: sql
+      path: postgresql+psycopg://feast_user:secret@db.internal:5432/feast_registry
+      cache_ttl_seconds: 60
+      cache_mode: thread
+    online_store:
+      type: redis
+      connection_string: "redis://redis.internal:6379/0"
+    offline_store:
+      type: redshift
+      region: us-east-1
+      cluster_id: prod-redshift
+      database: feast
+      user: feast_user
+      s3_staging_location: s3://feast-prod-staging/redshift
+      iam_role: arn:aws:iam::123456789012:role/FeastProdRole
+    feature_server:
+      type: local
+      metrics:
+        enabled: true
+        request: true
+        online_features: true
+        freshness: true
+    auth:
+      type: oidc
+      client_id: feast-server
+      auth_discovery_url: https://auth.example.com/realms/prod/.well-known/openid-configuration
+    entity_key_serialization_version: 3
+    materialization:
+      pull_latest_features: true
+    ```
+  </Tab>
+</Tabs>

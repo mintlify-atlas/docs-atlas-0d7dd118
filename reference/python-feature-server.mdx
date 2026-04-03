@@ -1,0 +1,580 @@
+---
+title: "Python feature server"
+description: "Serve online features over HTTP/JSON using the Python-based feature server. Supports REST API access from any language, push sources, materialization, Prometheus metrics, and TLS."
+---
+
+The Python feature server is an HTTP endpoint that serves features with JSON I/O. It lets you read and write features from the online store using any programming language that can make HTTP requests.
+
+<Info>
+  The Python feature server is best suited for teams that need broad language
+  compatibility, rich middleware support (auth, logging, transforms), or are
+  already running Python infrastructure. For raw throughput, consider the [Go
+  feature server](/reference/go-feature-server).
+</Info>
+
+## Starting the server
+
+Run `feast serve` from inside your feature repository directory.
+
+```bash
+feast serve
+```
+
+The server starts on `http://127.0.0.1:6566` by default.
+
+### CLI options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--host` | `127.0.0.1` | Bind address |
+| `--port` | `6566` | Listening port |
+| `--workers`, `-w` | `1` | Worker process count. Use `-1` to auto-calculate (`2 × CPU cores + 1`) |
+| `--worker-connections` | `1000` | Maximum simultaneous clients per worker |
+| `--max-requests` | `1000` | Requests before worker restart (prevents memory leaks) |
+| `--max-requests-jitter` | `50` | Jitter added to max-requests to prevent thundering herd |
+| `--registry_ttl_sec`, `-r` | `60` | Registry refresh interval in seconds |
+| `--keep-alive-timeout` | `30` | Keep-alive connection timeout in seconds |
+| `--no-access-log` | — | Suppress per-request access log lines |
+| `--metrics` | — | Enable Prometheus metrics endpoint |
+| `--key` | — | Path to TLS private key (`key.pem`) |
+| `--cert` | — | Path to TLS certificate (`cert.pem`) |
+
+### Quick-start example
+
+<Steps>
+  <Step title="Initialize and apply the feature repo">
+    ```bash
+    feast init feature_repo
+    cd feature_repo
+    feast apply
+    ```
+  </Step>
+  <Step title="Materialize features into the online store">
+    ```bash
+    feast materialize-incremental $(date +%Y-%m-%dT%H:%M:%S)
+    ```
+  </Step>
+  <Step title="Start the feature server">
+    ```bash
+    feast serve
+    ```
+
+    You should see:
+
+    ```
+    INFO: Uvicorn running on http://127.0.0.1:6566 (Press CTRL+C to quit)
+    ```
+  </Step>
+</Steps>
+
+### Production configuration
+
+```bash
+# Auto-scale workers to CPU count, tune connections and registry TTL
+feast serve --workers -1 --worker-connections 1000 --registry_ttl_sec 60
+
+# Manual worker count with memory-leak protection
+feast serve --workers 8 --worker-connections 2000 --max-requests 1000 --max-requests-jitter 50
+```
+
+<Tip>
+  Use `--workers -1` in production to automatically calculate the optimal worker count based on available CPU cores. Set `--registry_ttl_sec 60` or higher to reduce overhead from registry refreshes.
+</Tip>
+
+---
+
+## REST API reference
+
+All endpoints listen on port `6566` by default.
+
+### `GET /health`
+
+Returns the server health status.
+
+<CodeGroup>
+
+```bash curl
+curl http://localhost:6566/health
+```
+
+</CodeGroup>
+
+**Response:** `200 OK` with an empty body when the server is ready.
+
+---
+
+### `POST /get-online-features`
+
+Retrieve features from the online store for one or more entities.
+
+<CodeGroup>
+
+```bash curl (feature list)
+curl -X POST "http://localhost:6566/get-online-features" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "features": [
+      "driver_hourly_stats:conv_rate",
+      "driver_hourly_stats:acc_rate",
+      "driver_hourly_stats:avg_daily_trips"
+    ],
+    "entities": {
+      "driver_id": [1001, 1002, 1003]
+    }
+  }' | jq
+```
+
+```bash curl (feature service)
+curl -X POST "http://localhost:6566/get-online-features" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "feature_service": "driver_activity",
+    "entities": {
+      "driver_id": [1001, 1002, 1003]
+    }
+  }' | jq
+```
+
+</CodeGroup>
+
+#### Request body
+
+<ParamField body="features" type="string[]">
+  List of features to retrieve in `"<feature_view>:<feature>"` format. Mutually exclusive with `feature_service`.
+</ParamField>
+
+<ParamField body="feature_service" type="string">
+  Name of a feature service to retrieve features from. Mutually exclusive with `features`.
+</ParamField>
+
+<ParamField body="entities" type="object" required>
+  Map of entity name to list of entity values. Each list position corresponds to one entity row.
+</ParamField>
+
+<ParamField body="full_feature_names" type="boolean" default="false">
+  When `true`, response feature names are prefixed with the feature view name (e.g. `driver_hourly_stats__conv_rate`).
+</ParamField>
+
+#### Response
+
+```json
+{
+  "metadata": {
+    "feature_names": [
+      "driver_id",
+      "conv_rate",
+      "avg_daily_trips",
+      "acc_rate"
+    ]
+  },
+  "results": [
+    {
+      "values": [1001, 0.7037263512611389, 308, 0.8724706768989563],
+      "statuses": ["PRESENT", "PRESENT", "PRESENT", "PRESENT"],
+      "event_timestamps": [
+        "1970-01-01T00:00:00Z",
+        "2021-12-31T23:00:00Z",
+        "2021-12-31T23:00:00Z",
+        "2021-12-31T23:00:00Z"
+      ]
+    },
+    {
+      "values": [1002, 0.038169607520103455, 332, 0.48534533381462097],
+      "statuses": ["PRESENT", "PRESENT", "PRESENT", "PRESENT"],
+      "event_timestamps": [
+        "1970-01-01T00:00:00Z",
+        "2021-12-31T23:00:00Z",
+        "2021-12-31T23:00:00Z",
+        "2021-12-31T23:00:00Z"
+      ]
+    },
+    {
+      "values": [1003, 0.9665873050689697, 779, 0.7793770432472229],
+      "statuses": ["PRESENT", "PRESENT", "PRESENT", "PRESENT"],
+      "event_timestamps": [
+        "1970-01-01T00:00:00Z",
+        "2021-12-31T23:00:00Z",
+        "2021-12-31T23:00:00Z",
+        "2021-12-31T23:00:00Z"
+      ]
+    }
+  ]
+}
+```
+
+<ResponseField name="metadata" type="object" required>
+  <Expandable title="properties">
+    <ResponseField name="feature_names" type="string[]">
+      Ordered list of feature names corresponding to each position in `results[*].values`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results" type="object[]" required>
+  One element per entity row in the request.
+  <Expandable title="properties">
+    <ResponseField name="values" type="any[]">
+      Feature values in the same order as `metadata.feature_names`.
+    </ResponseField>
+    <ResponseField name="statuses" type="string[]">
+      Per-feature status: `PRESENT`, `MISSING`, or `OUTSIDE_MAX_AGE`.
+    </ResponseField>
+    <ResponseField name="event_timestamps" type="string[]">
+      ISO 8601 timestamps for each feature value.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+### `POST /push`
+
+Push feature values to the online store, offline store, or both via a [push source](/reference/data-sources).
+
+<CodeGroup>
+
+```bash curl
+curl -X POST "http://localhost:6566/push" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "push_source_name": "driver_stats_push_source",
+    "df": {
+      "driver_id": [1001],
+      "event_timestamp": ["2022-05-13 10:59:42+00:00"],
+      "created": ["2022-05-13 10:59:42"],
+      "conv_rate": [1.0],
+      "acc_rate": [1.0],
+      "avg_daily_trips": [1000]
+    },
+    "to": "online_and_offline"
+  }' | jq
+```
+
+```python Python
+import json
+import requests
+from datetime import datetime
+
+push_data = {
+    "push_source_name": "driver_stats_push_source",
+    "df": {
+        "driver_id": [1001],
+        "event_timestamp": [str(datetime(2022, 5, 13, 10, 59, 42))],
+        "created": [str(datetime(2022, 5, 13, 10, 59, 42))],
+        "conv_rate": [1.0],
+        "acc_rate": [1.0],
+        "avg_daily_trips": [1000],
+    },
+    "to": "online",
+}
+
+requests.post("http://localhost:6566/push", data=json.dumps(push_data))
+```
+
+</CodeGroup>
+
+#### Request body
+
+<ParamField body="push_source_name" type="string" required>
+  Name of the push source registered in the feature store.
+</ParamField>
+
+<ParamField body="df" type="object" required>
+  Column-oriented data map. Each key is a column name and the value is a list of values. All lists must have equal length. Timestamps must be strings and should be timezone-aware when targeting an offline store.
+</ParamField>
+
+<ParamField body="to" type="string" default="online">
+  Destination for the push. One of `"online"`, `"offline"`, or `"online_and_offline"`.
+</ParamField>
+
+<ParamField body="allow_registry_cache" type="boolean" default="true">
+  Allow using the cached registry for push source lookup.
+</ParamField>
+
+<ParamField body="transform_on_write" type="boolean" default="true">
+  Apply on-demand feature view transformations before writing.
+</ParamField>
+
+<Note>
+  When `to` is `"online_and_offline"`, the online write is immediate and the offline write is subject to batching configuration (see below).
+</Note>
+
+#### Offline write batching
+
+You can batch offline writes triggered by `/push` to reduce overhead on the offline store.
+
+```yaml
+# feature_store.yaml
+feature_server:
+  type: local
+  offline_push_batching_enabled: true
+  offline_push_batching_batch_size: 1000
+  offline_push_batching_batch_interval_seconds: 10
+```
+
+| Setting | Description |
+|---|---|
+| `offline_push_batching_enabled` | Enable batching for offline writes |
+| `offline_push_batching_batch_size` | Flush when this many rows are buffered |
+| `offline_push_batching_batch_interval_seconds` | Flush at this interval regardless of row count |
+
+---
+
+### `POST /write-to-online-store`
+
+Write feature values directly to the online store by feature view name.
+
+<CodeGroup>
+
+```bash curl
+curl -X POST "http://localhost:6566/write-to-online-store" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "feature_view_name": "driver_hourly_stats",
+    "df": {
+      "driver_id": [1001],
+      "event_timestamp": ["2022-05-13 10:59:42+00:00"],
+      "conv_rate": [0.85],
+      "acc_rate": [0.92],
+      "avg_daily_trips": [450]
+    }
+  }' | jq
+```
+
+</CodeGroup>
+
+#### Request body
+
+<ParamField body="feature_view_name" type="string" required>
+  Name of the feature view to write to.
+</ParamField>
+
+<ParamField body="df" type="object" required>
+  Column-oriented data map matching the feature view schema.
+</ParamField>
+
+<ParamField body="allow_registry_cache" type="boolean" default="true">
+  Use the cached registry for feature view lookup.
+</ParamField>
+
+---
+
+### `POST /materialize`
+
+Trigger materialization from the offline store to the online store.
+
+<CodeGroup>
+
+```bash curl (with timestamps)
+curl -X POST "http://localhost:6566/materialize" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start_ts": "2021-01-01T00:00:00",
+    "end_ts": "2021-01-02T00:00:00",
+    "feature_views": ["driver_hourly_stats"]
+  }' | jq
+```
+
+```bash curl (without event timestamps)
+curl -X POST "http://localhost:6566/materialize" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "feature_views": ["driver_hourly_stats"],
+    "disable_event_timestamp": true
+  }' | jq
+```
+
+</CodeGroup>
+
+#### Request body
+
+<ParamField body="start_ts" type="string">
+  ISO 8601 start of the materialization window. Required unless `disable_event_timestamp` is `true`.
+</ParamField>
+
+<ParamField body="end_ts" type="string">
+  ISO 8601 end of the materialization window. Required unless `disable_event_timestamp` is `true`.
+</ParamField>
+
+<ParamField body="feature_views" type="string[]">
+  List of feature view names to materialize. Materializes all views if omitted.
+</ParamField>
+
+<ParamField body="disable_event_timestamp" type="boolean" default="false">
+  When `true`, materializes all available data without filtering by timestamp. Useful when source data has no event timestamp column.
+</ParamField>
+
+---
+
+## Permissions and access control
+
+| Endpoint | Resource type | Required permission |
+|---|---|---|
+| `GET /health` | — | None |
+| `POST /get-online-features` | `FeatureView`, `OnDemandFeatureView` | Read Online |
+| `POST /push` | `FeatureView` | Write Online / Write Offline / Write Online and Offline |
+| `POST /write-to-online-store` | `FeatureView` | Write Online |
+| `POST /materialize` | `FeatureView` | Write Online |
+| `POST /materialize-incremental` | `FeatureView` | Write Online |
+
+Pass a Bearer token in the `Authorization` header when authentication is enabled:
+
+```bash
+curl -X POST "http://localhost:6566/get-online-features" \
+  -H "Authorization: Bearer <your-token>" \
+  -H "Content-Type: application/json" \
+  -d '{ ... }'
+```
+
+See the [authorization guide](/guides/authorization) for setup instructions.
+
+---
+
+## Prometheus metrics
+
+The server can expose Prometheus-compatible metrics on a dedicated port (default `8000`). Metrics are disabled by default.
+
+### Enabling metrics
+
+<Tabs>
+  <Tab title="CLI flag">
+    ```bash
+    feast serve --metrics
+    ```
+  </Tab>
+  <Tab title="feature_store.yaml">
+    ```yaml
+    feature_server:
+      type: local
+      metrics:
+        enabled: true
+    ```
+  </Tab>
+</Tabs>
+
+### Per-category control
+
+```yaml
+feature_server:
+  type: local
+  metrics:
+    enabled: true
+    resource: true          # CPU / memory gauges
+    request: true           # endpoint latency and request counters
+    online_features: true   # online feature retrieval counters
+    push: true              # push request counters
+    materialization: true   # materialization counters and duration
+    freshness: true         # feature freshness gauges
+```
+
+Setting any category to `false` disables all instrumentation for that category.
+
+### Available metrics
+
+| Metric | Type | Labels | Category |
+|---|---|---|---|
+| `feast_feature_server_cpu_usage` | Gauge | — | `resource` |
+| `feast_feature_server_memory_usage` | Gauge | — | `resource` |
+| `feast_feature_server_request_total` | Counter | `endpoint`, `status` | `request` |
+| `feast_feature_server_request_latency_seconds` | Histogram | `endpoint`, `feature_count`, `feature_view_count` | `request` |
+| `feast_online_features_request_total` | Counter | — | `online_features` |
+| `feast_online_features_entity_count` | Histogram | — | `online_features` |
+| `feast_feature_server_online_store_read_duration_seconds` | Histogram | — | `online_features` |
+| `feast_feature_server_transformation_duration_seconds` | Histogram | `odfv_name`, `mode` | `online_features` |
+| `feast_push_request_total` | Counter | `push_source`, `mode` | `push` |
+| `feast_materialization_result_total` | Counter | `feature_view`, `status` | `materialization` |
+| `feast_materialization_duration_seconds` | Histogram | `feature_view` | `materialization` |
+| `feast_feature_freshness_seconds` | Gauge | `feature_view`, `project` | `freshness` |
+
+### ODFV transformation metrics
+
+Transformation timing metrics require both server-level and per-ODFV opt-in:
+
+```python
+from feast.on_demand_feature_view import on_demand_feature_view
+
+@on_demand_feature_view(
+    sources=[my_feature_view, my_request_source],
+    schema=[Field(name="output", dtype=Float64)],
+    track_metrics=True,  # opt in to transformation timing
+)
+def my_transform(inputs: pd.DataFrame) -> pd.DataFrame:
+    ...
+```
+
+### Prometheus scrape config
+
+```yaml
+scrape_configs:
+  - job_name: feast
+    static_configs:
+      - targets: ["localhost:8000"]
+```
+
+### Multi-worker and Kubernetes support
+
+Feast uses Prometheus multiprocess mode so metrics are correct across Gunicorn workers and Kubernetes replicas. Each worker writes to a shared directory; the metrics endpoint aggregates all workers automatically.
+
+For Kubernetes deployments using the Feast Operator, set `metrics: true` in your `FeatureStore` CR:
+
+```yaml
+spec:
+  services:
+    onlineStore:
+      server:
+        metrics: true
+```
+
+The operator automatically exposes port `8000` and creates the corresponding Service port.
+
+---
+
+## TLS/SSL
+
+Enabling TLS encrypts traffic between clients and the feature server.
+
+<Steps>
+  <Step title="Generate a self-signed certificate (development only)">
+    ```bash
+    openssl req -x509 -newkey rsa:2048 \
+      -keyout key.pem -out cert.pem \
+      -days 365 -nodes
+    ```
+
+    This produces `key.pem` (private key) and `cert.pem` (public certificate).
+
+    <Warning>
+      Self-signed certificates are for development only. Use a certificate from a
+      trusted CA in production.
+    </Warning>
+  </Step>
+  <Step title="Start the server with TLS">
+    ```bash
+    feast serve --key /path/to/key.pem --cert /path/to/cert.pem
+    ```
+
+    The server URL changes to `https://`:
+
+    ```
+    [INFO] Listening at: https://127.0.0.1:6566
+    ```
+  </Step>
+  <Step title="Configure clients to trust the certificate">
+    In `feature_store.yaml` for your client:
+
+    ```yaml
+    online_store:
+      type: remote
+      path: https://localhost:6566
+      cert: /path/to/cert.pem
+    ```
+
+    The `cert` field is optional if the certificate is already trusted by the system CA store. You can also set the `FEAST_CA_CERT_FILE_PATH` environment variable to point to the CA bundle.
+  </Step>
+</Steps>
+
+---
+
+## Deploying on Kubernetes
+
+The feature server can be deployed on Kubernetes using the Feast Operator. See the [Kubernetes deployment guide](/deployment/kubernetes) for a complete walkthrough.

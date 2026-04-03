@@ -1,0 +1,911 @@
+---
+title: "Online Stores"
+description: "Reference for all online store backends supported by Feast, used for low-latency feature serving at inference time."
+---
+
+The online store is responsible for storing the latest feature values and serving them with low latency during model inference. Feast materializes data from the offline store into the online store via the `feast materialize` command.
+
+## Core interface
+
+Every online store exposes the following operations:
+
+| Method | Description |
+|:--|:--|
+| `online_write_batch` | Write feature values to the online store |
+| `online_read` | Read feature values from the online store |
+| `update` | Create or update infrastructure (e.g. tables, collections) |
+| `teardown` | Remove infrastructure when features are deleted |
+| `plan` | Generate a diff of infrastructure changes before applying |
+
+## Functionality matrix
+
+| | SQLite | Redis | DynamoDB | Bigtable | Datastore | Postgres | Cassandra | MongoDB | Elasticsearch | Milvus |
+|:--|:--|:--|:--|:--|:--|:--|:--|:--|:--|:--|
+| Write features | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes |
+| Read features | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes |
+| Update infrastructure | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes |
+| Teardown infrastructure | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes |
+| Plan infrastructure changes | yes | no | no | no | no | no | yes | no | no | no |
+| On-demand transforms | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes |
+| Python SDK readable | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes |
+| Java readable | no | yes | no | no | no | no | no | no | no | no |
+| Go readable | yes | yes | no | no | no | no | no | no | no | no |
+| Entityless feature views | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes |
+| Concurrent writes | no | yes | no | yes | no | no | no | yes | no | yes |
+| TTL support | no | yes | no | no | no | no | no | no | no | yes |
+| Delete expired data | no | yes | no | no | no | no | no | no | no | yes |
+| Vector similarity search | no | no | no | no | no | yes\* | no | no | yes | yes |
+
+\* Requires `vector_enabled: true` and the pgvector extension.
+
+---
+
+## Store reference
+
+<Tabs>
+
+<Tab title="SQLite">
+
+### SQLite online store
+
+SQLite is the default online store for local development. All feature values are stored in an on-disk SQLite database. Only the latest feature value per entity key is retained.
+
+No additional installation is required — SQLite ships with Python.
+
+**Configuration:**
+
+```yaml
+project: my_feature_repo
+registry: data/registry.db
+provider: local
+online_store:
+  type: sqlite
+  path: data/online_store.db
+```
+
+<ParamField path="body.type" type="string" required>
+  Must be `sqlite`.
+</ParamField>
+
+<ParamField path="body.path" type="string" required>
+  Filesystem path to the SQLite database file. Will be created if it does not exist.
+</ParamField>
+
+<Tip>
+  SQLite is ideal for local development and testing. It is not suitable for production — use Redis, DynamoDB, or another distributed store instead.
+</Tip>
+
+</Tab>
+
+<Tab title="Redis / DragonflyDB / ScyllaDB">
+
+### Redis online store
+
+Redis is a core online store implementation providing low-latency feature serving with full TTL support. Both standalone Redis and Redis Cluster and Redis Sentinel topologies are supported.
+
+**Install:**
+
+```bash
+pip install 'feast[redis]'
+```
+
+**Configuration (standalone):**
+
+```yaml
+project: my_feature_repo
+registry: data/registry.db
+provider: local
+online_store:
+  type: redis
+  connection_string: "localhost:6379"
+```
+
+**Configuration (Redis Cluster with SSL and password):**
+
+```yaml
+project: my_feature_repo
+registry: data/registry.db
+provider: local
+online_store:
+  type: redis
+  redis_type: redis_cluster
+  connection_string: "redis1:6379,redis2:6379,ssl=true,password=my_password"
+```
+
+**Configuration (Redis Sentinel):**
+
+```yaml
+project: my_feature_repo
+registry: data/registry.db
+provider: local
+online_store:
+  type: redis
+  redis_type: redis_sentinel
+  sentinel_master: mymaster
+  connection_string: "redis1:26379,ssl=true,password=my_password"
+```
+
+**Configuration (with TTL):**
+
+```yaml
+project: my_feature_repo
+registry: data/registry.db
+provider: local
+online_store:
+  type: redis
+  connection_string: "localhost:6379"
+  key_ttl_seconds: 604800  # 7 days
+```
+
+<ParamField path="body.type" type="string" required>
+  Must be `redis`.
+</ParamField>
+
+<ParamField path="body.connection_string" type="string" required>
+  Redis connection string. Comma-separated for cluster mode. Supports `ssl=true` and `password=...` query parameters.
+</ParamField>
+
+<ParamField path="body.redis_type" type="string" default="redis">
+  Redis topology. Options: `redis` (standalone), `redis_cluster`, `redis_sentinel`.
+</ParamField>
+
+<ParamField path="body.sentinel_master" type="string">
+  Sentinel master name. Required when `redis_type` is `redis_sentinel`.
+</ParamField>
+
+<ParamField path="body.key_ttl_seconds" type="number">
+  TTL in seconds applied at the entity level. All feature values for an entity expire together.
+</ParamField>
+
+---
+
+### DragonflyDB
+
+[DragonflyDB](https://github.com/dragonflydb/dragonfly) is a Redis-compatible in-memory datastore with improved multi-threaded performance. Use it as a drop-in replacement for Redis by pointing the Redis online store configuration at your Dragonfly instance.
+
+**Install:** `pip install 'feast[redis]'`
+
+```yaml
+project: my_feature_repo
+registry: data/registry.db
+provider: local
+online_store:
+  type: redis
+  connection_string: "localhost:6379"
+```
+
+Start Dragonfly with Docker:
+
+```bash
+docker run --network=host --ulimit memlock=-1 \
+    docker.dragonflydb.io/dragonflydb/dragonfly
+```
+
+<Note>
+  No code changes are needed to switch from Redis to DragonflyDB — only update the `connection_string` to point at the Dragonfly instance.
+</Note>
+
+---
+
+### ScyllaDB
+
+ScyllaDB is a Cassandra-compatible database. Use the Cassandra online store connector (`feast[cassandra]`) to connect to ScyllaDB or ScyllaDB Cloud.
+
+**Install:** `pip install 'feast[cassandra]'`
+
+**Configuration (self-hosted ScyllaDB):**
+
+```yaml
+project: scylla_feature_repo
+registry: data/registry.db
+provider: local
+online_store:
+    type: cassandra
+    hosts:
+        - 172.17.0.2
+    keyspace: feast
+    username: scylla
+    password: password
+```
+
+**Configuration (ScyllaDB Cloud):**
+
+```yaml
+project: scylla_feature_repo
+registry: data/registry.db
+provider: local
+online_store:
+    type: cassandra
+    hosts:
+        - node-0.aws_us_east_1.xxxxxxxx.clusters.scylla.cloud
+        - node-1.aws_us_east_1.xxxxxxxx.clusters.scylla.cloud
+        - node-2.aws_us_east_1.xxxxxxxx.clusters.scylla.cloud
+    keyspace: feast
+    username: scylla
+    password: password
+```
+
+</Tab>
+
+<Tab title="DynamoDB">
+
+### DynamoDB online store
+
+The DynamoDB online store materializes feature values into AWS DynamoDB tables.
+
+**Install:**
+
+```bash
+pip install 'feast[aws]'
+```
+
+Initialize a new feature repo:
+
+```bash
+feast init REPO_NAME -t aws
+```
+
+**Configuration:**
+
+```yaml
+project: my_feature_repo
+registry: data/registry.db
+provider: aws
+online_store:
+  type: dynamodb
+  region: us-west-2
+```
+
+**Configuration (with performance tuning):**
+
+```yaml
+project: my_feature_repo
+registry: data/registry.db
+provider: aws
+online_store:
+  type: dynamodb
+  region: us-west-2
+  batch_size: 100
+  max_read_workers: 10
+  consistent_reads: false
+```
+
+<ParamField path="body.type" type="string" required>
+  Must be `dynamodb`.
+</ParamField>
+
+<ParamField path="body.region" type="string" required>
+  AWS region where DynamoDB tables are created.
+</ParamField>
+
+<ParamField path="body.table_name_template" type="string" default="{project}.{table_name}">
+  Template used to derive DynamoDB table names from the Feast project and feature view name.
+</ParamField>
+
+<ParamField path="body.batch_size" type="number" default="100">
+  Number of items per `BatchGetItem` / `BatchWriteItem` call. Maximum is 100 (DynamoDB limit).
+</ParamField>
+
+<ParamField path="body.max_read_workers" type="number" default="10">
+  Maximum parallel threads for batch read operations. Increase for high-throughput workloads (e.g. up to 20–30).
+</ParamField>
+
+<ParamField path="body.consistent_reads" type="boolean" default="false">
+  When `true`, uses strongly consistent reads (higher latency but guaranteed latest data).
+</ParamField>
+
+<ParamField path="body.tags" type="object">
+  AWS resource tags applied to each DynamoDB table.
+</ParamField>
+
+<ParamField path="body.session_based_auth" type="boolean" default="false">
+  Use AWS session-based client authentication.
+</ParamField>
+
+**Performance tuning:**
+
+DynamoDB's `BatchGetItem` is limited to 100 items per request. For 500 entities, Feast issues 5 batches. With `max_read_workers: 10`, those 5 batches run in parallel — reducing latency from `5 × 10ms = 50ms` to approximately `10ms`.
+
+**Required IAM policy:**
+
+```json
+{
+    "Statement": [
+        {
+            "Action": [
+                "dynamodb:CreateTable",
+                "dynamodb:DescribeTable",
+                "dynamodb:DeleteTable",
+                "dynamodb:TagResource",
+                "dynamodb:BatchWriteItem",
+                "dynamodb:BatchGetItem"
+            ],
+            "Effect": "Allow",
+            "Resource": [
+                "arn:aws:dynamodb:<region>:<account_id>:table/*"
+            ]
+        }
+    ],
+    "Version": "2012-10-17"
+}
+```
+
+</Tab>
+
+<Tab title="Bigtable + Datastore">
+
+### Bigtable online store
+
+The Bigtable online store materializes feature values into Google Cloud Bigtable.
+
+**Install:**
+
+```bash
+pip install 'feast[gcp]'
+```
+
+Initialize a new feature repo:
+
+```bash
+feast init REPO_NAME -t gcp
+```
+
+**Configuration:**
+
+```yaml
+project: my_feature_repo
+registry: data/registry.db
+provider: gcp
+online_store:
+  type: bigtable
+  project_id: my_gcp_project
+  instance: my_bigtable_instance
+```
+
+<ParamField path="body.type" type="string" required>
+  Must be `bigtable`.
+</ParamField>
+
+<ParamField path="body.project_id" type="string" required>
+  GCP project ID.
+</ParamField>
+
+<ParamField path="body.instance" type="string" required>
+  Bigtable instance ID.
+</ParamField>
+
+---
+
+### Datastore online store
+
+The Datastore online store materializes feature values into Google Cloud Datastore.
+
+**Install:** `pip install 'feast[gcp]'`
+
+**Configuration:**
+
+```yaml
+project: my_feature_repo
+registry: data/registry.db
+provider: gcp
+online_store:
+  type: datastore
+  project_id: my_gcp_project
+  namespace: my_datastore_namespace
+```
+
+<ParamField path="body.type" type="string" required>
+  Must be `datastore`.
+</ParamField>
+
+<ParamField path="body.project_id" type="string" required>
+  GCP project ID.
+</ParamField>
+
+<ParamField path="body.namespace" type="string">
+  Cloud Datastore namespace. Defaults to the default namespace if omitted.
+</ParamField>
+
+</Tab>
+
+<Tab title="Postgres">
+
+### PostgreSQL online store (contrib)
+
+The PostgreSQL online store materializes feature values into a PostgreSQL database. Supports optional vector similarity search via the [pgvector](https://github.com/pgvector/pgvector) extension.
+
+**Install:**
+
+```bash
+pip install 'feast[postgres]'
+```
+
+**Configuration:**
+
+```yaml
+project: my_feature_repo
+registry: data/registry.db
+provider: local
+online_store:
+    type: postgres
+    host: DB_HOST
+    port: 5432
+    database: DB_NAME
+    db_schema: public
+    user: DB_USERNAME
+    password: DB_PASSWORD
+    sslmode: require
+    vector_enabled: false
+```
+
+**Configuration (with TLS and pgvector):**
+
+```yaml
+project: my_feature_repo
+registry: data/registry.db
+provider: local
+online_store:
+    type: postgres
+    host: DB_HOST
+    port: 5432
+    database: DB_NAME
+    db_schema: public
+    user: DB_USERNAME
+    password: DB_PASSWORD
+    sslmode: verify-ca
+    sslkey_path: /path/to/client-key.pem
+    sslcert_path: /path/to/client-cert.pem
+    sslrootcert_path: /path/to/server-ca.pem
+    vector_enabled: true
+```
+
+<ParamField path="body.host" type="string" required>
+  PostgreSQL host.
+</ParamField>
+
+<ParamField path="body.port" type="number" default="5432">
+  PostgreSQL port.
+</ParamField>
+
+<ParamField path="body.database" type="string" required>
+  Database name.
+</ParamField>
+
+<ParamField path="body.db_schema" type="string" default="public">
+  PostgreSQL schema name.
+</ParamField>
+
+<ParamField path="body.user" type="string" required>
+  Database user.
+</ParamField>
+
+<ParamField path="body.password" type="string">
+  Database password.
+</ParamField>
+
+<ParamField path="body.sslmode" type="string" default="require">
+  SSL mode. Options: `disable`, `require`, `verify-ca`, `verify-full`.
+</ParamField>
+
+<ParamField path="body.sslrootcert_path" type="string">
+  Path to the server CA certificate. Required for `verify-ca` and `verify-full`.
+</ParamField>
+
+<ParamField path="body.sslcert_path" type="string">
+  Path to the client certificate (for mutual TLS).
+</ParamField>
+
+<ParamField path="body.sslkey_path" type="string">
+  Path to the client private key (for mutual TLS).
+</ParamField>
+
+<ParamField path="body.vector_enabled" type="boolean" default="false">
+  Enable pgvector support for vector similarity search. Requires the `vector` extension to be installed in the database (`CREATE EXTENSION vector;`).
+</ParamField>
+
+**Vector similarity search:**
+
+When `vector_enabled: true`, use `retrieve_online_documents` to find the top-k nearest vectors to a query embedding:
+
+```python
+from feast import FeatureStore
+from feast.infra.online_stores.postgres_online_store import retrieve_online_documents
+
+feature_store = FeatureStore(repo_path=".")
+
+query_vector = [0.1, 0.2, 0.3, 0.4, 0.5]
+top_k = 5
+
+results = retrieve_online_documents(
+    feature_store=feature_store,
+    feature_view_name="document_fv:embedding_float",
+    query_vector=query_vector,
+    top_k=top_k,
+)
+```
+
+<Note>
+  Before enabling `vector_enabled`, run `CREATE EXTENSION vector;` in the target PostgreSQL database. See the [pgvector repository](https://github.com/pgvector/pgvector) for installation instructions.
+</Note>
+
+</Tab>
+
+<Tab title="Cassandra">
+
+### Cassandra / Astra DB online store (contrib)
+
+The Cassandra online store materializes feature values into Apache Cassandra or DataStax Astra DB. Each feature view maps to a dedicated Cassandra table within a keyspace.
+
+**Install:**
+
+```bash
+pip install 'feast[cassandra]'
+```
+
+**Configuration (Apache Cassandra):**
+
+```yaml
+project: my_feature_repo
+registry: data/registry.db
+provider: local
+online_store:
+    type: cassandra
+    hosts:
+        - 192.168.1.1
+        - 192.168.1.2
+        - 192.168.1.3
+    keyspace: feast_keyspace
+    port: 9042
+    username: user
+    password: secret
+    protocol_version: 5
+    load_balancing:
+        local_dc: datacenter1
+        load_balancing_policy: TokenAwarePolicy(DCAwareRoundRobinPolicy)
+    read_concurrency: 100
+    write_concurrency: 100
+```
+
+**Configuration (Astra DB):**
+
+```yaml
+project: my_feature_repo
+registry: data/registry.db
+provider: local
+online_store:
+    type: cassandra
+    secure_bundle_path: /path/to/secure/bundle.zip
+    keyspace: feast_keyspace
+    username: Client_ID
+    password: Client_Secret
+    protocol_version: 4
+    load_balancing:
+        local_dc: eu-central-1
+        load_balancing_policy: TokenAwarePolicy(DCAwareRoundRobinPolicy)
+```
+
+<ParamField path="body.type" type="string" required>
+  Must be `cassandra`.
+</ParamField>
+
+<ParamField path="body.hosts" type="string[]">
+  List of Cassandra node IP addresses or hostnames. Not required when using `secure_bundle_path`.
+</ParamField>
+
+<ParamField path="body.keyspace" type="string" required>
+  Cassandra keyspace that contains all Feast feature tables.
+</ParamField>
+
+<ParamField path="body.port" type="number" default="9042">
+  Cassandra native transport port.
+</ParamField>
+
+<ParamField path="body.username" type="string">
+  Cassandra / Astra DB username (Client ID for Astra DB).
+</ParamField>
+
+<ParamField path="body.password" type="string">
+  Cassandra / Astra DB password (Client Secret for Astra DB).
+</ParamField>
+
+<ParamField path="body.secure_bundle_path" type="string">
+  Path to the Astra DB secure connect bundle zip file. Use instead of `hosts` for Astra DB connections.
+</ParamField>
+
+<ParamField path="body.protocol_version" type="number">
+  CQL native protocol version. Use `5` for Cassandra 4+, `4` for Astra DB and older clusters.
+</ParamField>
+
+<ParamField path="body.read_concurrency" type="number" default="100">
+  Maximum concurrent read operations.
+</ParamField>
+
+<ParamField path="body.write_concurrency" type="number" default="100">
+  Maximum concurrent write operations.
+</ParamField>
+
+<Note>
+  ScyllaDB is Cassandra-compatible and uses the same `type: cassandra` configuration. See the [Redis / DragonflyDB / ScyllaDB](/reference/online-stores#redis--dragonflydb--scylladb) tab for ScyllaDB-specific examples.
+</Note>
+
+</Tab>
+
+<Tab title="MongoDB">
+
+### MongoDB online store (preview)
+
+The MongoDB online store materializes feature values into MongoDB collections. Features from multiple feature views for the same entity are stored together in a single document (entity key collocation).
+
+<Warning>
+  The MongoDB online store is currently in preview. Breaking changes may occur in future releases.
+</Warning>
+
+**Install:**
+
+```bash
+pip install 'feast[mongodb]'
+```
+
+**Configuration (MongoDB Atlas):**
+
+```yaml
+project: my_feature_repo
+registry: data/registry.db
+provider: local
+online_store:
+  type: mongodb
+  connection_string: "mongodb+srv://username:password@cluster.mongodb.net/"
+  database_name: feast_online_store
+```
+
+**Configuration (self-hosted MongoDB):**
+
+```yaml
+project: my_feature_repo
+registry: data/registry.db
+provider: local
+online_store:
+  type: mongodb
+  connection_string: "mongodb://username:password@localhost:27017/"
+  database_name: feast_online_store
+  collection_suffix: features
+```
+
+**Configuration (replica set):**
+
+```yaml
+project: my_feature_repo
+registry: data/registry.db
+provider: local
+online_store:
+  type: mongodb
+  connection_string: "mongodb://host1:27017,host2:27017,host3:27017/?replicaSet=myReplicaSet"
+  database_name: feast_online_store
+  client_kwargs:
+    retryWrites: true
+    w: majority
+```
+
+<ParamField path="body.type" type="string" required>
+  Must be `mongodb`.
+</ParamField>
+
+<ParamField path="body.connection_string" type="string" required>
+  MongoDB connection URI. Supports MongoDB Atlas (`mongodb+srv://`), standalone, and replica set topologies.
+</ParamField>
+
+<ParamField path="body.database_name" type="string" required>
+  MongoDB database name.
+</ParamField>
+
+<ParamField path="body.collection_suffix" type="string">
+  Optional suffix appended to collection names.
+</ParamField>
+
+<ParamField path="body.client_kwargs" type="object">
+  Additional keyword arguments passed to `MongoClient` / `AsyncMongoClient` (e.g. `maxPoolSize`, `serverSelectionTimeoutMS`).
+</ParamField>
+
+**Async support:**
+
+MongoDB supports both sync and async operations natively using PyMongo 4.13+'s `AsyncMongoClient`:
+
+- `online_read` / `online_read_async`
+- `online_write_batch` / `online_write_batch_async`
+
+Async mode provides 10–20x throughput improvement for concurrent workloads.
+
+</Tab>
+
+<Tab title="Vector stores">
+
+### Elasticsearch online store (vector search)
+
+The Elasticsearch online store supports both tabular feature values and dense vector embeddings. Vectors are stored as `dense_vector` fields and support approximate nearest-neighbor search.
+
+**Install:**
+
+```bash
+pip install 'feast[elasticsearch]'
+```
+
+**Configuration:**
+
+```yaml
+project: my_feature_repo
+registry: data/registry.db
+provider: local
+online_store:
+    type: elasticsearch
+    host: ES_HOST
+    port: ES_PORT
+    user: ES_USERNAME
+    password: ES_PASSWORD
+    write_batch_size: 1000
+```
+
+<ParamField path="body.host" type="string" required>
+  Elasticsearch host.
+</ParamField>
+
+<ParamField path="body.port" type="number" required>
+  Elasticsearch port (typically `9200`).
+</ParamField>
+
+<ParamField path="body.user" type="string">
+  Elasticsearch username.
+</ParamField>
+
+<ParamField path="body.password" type="string">
+  Elasticsearch password.
+</ParamField>
+
+<ParamField path="body.write_batch_size" type="number" default="1000">
+  Number of documents per bulk write request.
+</ParamField>
+
+**Vector similarity search:**
+
+```python
+from feast import FeatureStore
+
+feature_store = FeatureStore(repo_path=".")
+
+query_vector = [1.0, 2.0, 3.0, 4.0, 5.0]
+top_k = 5
+
+results = feature_store.retrieve_online_documents_v2(
+    features=["my_feature_view:embedding"],
+    query=query_vector,
+    top_k=top_k,
+)
+```
+
+---
+
+### Milvus online store (vector search)
+
+The Milvus online store stores feature values in [Milvus](https://milvus.io/) and supports vector similarity search with configurable index types and distance metrics.
+
+**Install:**
+
+```bash
+pip install 'feast[milvus]'
+```
+
+**Configuration:**
+
+```yaml
+project: my_feature_repo
+registry: data/registry.db
+provider: local
+online_store:
+  type: milvus
+  path: "data/online_store.db"
+  connection_string: "localhost:19530"
+  embedding_dim: 128
+  index_type: "FLAT"
+  metric_type: "COSINE"
+  username: "username"
+  password: "password"
+```
+
+<ParamField path="body.type" type="string" required>
+  Must be `milvus`.
+</ParamField>
+
+<ParamField path="body.connection_string" type="string" required>
+  Milvus server address (host:port).
+</ParamField>
+
+<ParamField path="body.embedding_dim" type="number">
+  Dimensionality of the embedding vectors stored in Milvus.
+</ParamField>
+
+<ParamField path="body.index_type" type="string" default="FLAT">
+  Milvus index type (e.g. `FLAT`, `IVF_FLAT`, `HNSW`).
+</ParamField>
+
+<ParamField path="body.metric_type" type="string" default="COSINE">
+  Distance metric for similarity search (e.g. `COSINE`, `L2`, `IP`).
+</ParamField>
+
+<ParamField path="body.username" type="string">
+  Milvus username.
+</ParamField>
+
+<ParamField path="body.password" type="string">
+  Milvus password.
+</ParamField>
+
+<Note>
+  Milvus supports TTL and concurrent writes, making it suitable for high-throughput real-time retrieval augmented generation (RAG) pipelines.
+</Note>
+
+---
+
+### Qdrant online store (vector search)
+
+[Qdrant](https://qdrant.tech) is a vector similarity search engine. The Qdrant online store supports both standard feature retrieval and nearest-neighbor search using dense vectors.
+
+**Install:**
+
+```bash
+pip install 'feast[qdrant]'
+```
+
+**Configuration:**
+
+```yaml
+project: my_feature_repo
+registry: data/registry.db
+provider: local
+online_store:
+    type: qdrant
+    host: localhost
+    port: 6333
+    write_batch_size: 100
+```
+
+<ParamField path="body.type" type="string" required>
+  Must be `qdrant`.
+</ParamField>
+
+<ParamField path="body.host" type="string" required>
+  Qdrant server host.
+</ParamField>
+
+<ParamField path="body.port" type="number" default="6333">
+  Qdrant REST API port.
+</ParamField>
+
+<ParamField path="body.write_batch_size" type="number" default="100">
+  Number of points per upsert batch.
+</ParamField>
+
+**Vector similarity search:**
+
+Qdrant supports named vectors, allowing multiple vector fields per collection entry. Specify the vector to query in the feature repo config.
+
+```python
+from feast import FeatureStore
+
+feature_store = FeatureStore(repo_path=".")
+
+query_vector = [1.0, 2.0, 3.0, 4.0, 5.0]
+top_k = 5
+
+results = feature_store.retrieve_online_documents(
+    features=["my_feature_view:embedding"],
+    query=query_vector,
+    top_k=top_k,
+)
+```
+
+<Warning>
+  These retrieval APIs are subject to change in future versions of Feast.
+</Warning>
+
+</Tab>
+
+</Tabs>

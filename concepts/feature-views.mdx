@@ -1,0 +1,403 @@
+---
+title: "Feature Views"
+description: "Learn about FeatureView, OnDemandFeatureView, StreamFeatureView, and BatchFeatureView — the core abstractions for defining and organizing features in Feast."
+---
+
+A **feature view** is Feast's primary abstraction for defining a collection of related features. It ties together a data source, the entities those features belong to, the schema of the feature columns, and optional metadata like TTL and tags.
+
+- In **online** settings, a feature view is a _stateful_ collection read when `get_online_features` is called.
+- In **offline** settings, it is a _stateless_ collection created when `get_historical_features` is called.
+
+<Note>
+Feature views require time-stamped data. If your source data lacks timestamps, insert dummy timestamp values as a workaround.
+</Note>
+
+## The `FeatureView` class
+
+A `FeatureView` consists of:
+
+| Parameter | Required | Description |
+|---|---|---|
+| `name` | Yes | Unique identifier for the feature view within a project |
+| `source` | Yes | Batch data source (e.g. `BigQuerySource`, `FileSource`) |
+| `entities` | No | List of entities (can be empty for global features) |
+| `schema` | Recommended | List of `Field` objects defining features |
+| `ttl` | No | How far back Feast will look when retrieving historical features |
+| `tags` | No | Key-value metadata dictionary |
+| `description` | No | Human-readable description |
+| `online` | No | Whether online retrieval is enabled (default `True`) |
+| `enable_validation` | No | Enable schema validation during materialization |
+
+### Basic example
+
+```python
+from feast import BigQuerySource, Entity, FeatureView, Field
+from feast.types import Float32, Int64
+from datetime import timedelta
+
+driver = Entity(name="driver", join_keys=["driver_id"])
+
+driver_stats_fv = FeatureView(
+    name="driver_activity",
+    entities=[driver],
+    ttl=timedelta(days=7),
+    schema=[
+        Field(name="trips_today", dtype=Int64),
+        Field(name="rating", dtype=Float32),
+    ],
+    source=BigQuerySource(
+        table="feast-oss.demo_data.driver_activity"
+    ),
+    tags={"team": "driver-team", "version": "v1"},
+)
+```
+
+### Feature views without entities
+
+For global features not tied to a specific entity, omit the `entities` parameter:
+
+```python
+from feast import BigQuerySource, FeatureView, Field
+from feast.types import Int64
+
+global_stats_fv = FeatureView(
+    name="global_stats",
+    entities=[],
+    schema=[
+        Field(name="total_trips_today_by_all_drivers", dtype=Int64),
+    ],
+    source=BigQuerySource(
+        table="feast-oss.demo_data.global_stats"
+    ),
+)
+```
+
+## Fields
+
+A `Field` represents a single feature column — essentially a named, typed schema element. Every field has a `name` and a `dtype` drawn from `feast.types`.
+
+```python
+from feast import Field
+from feast.types import Float32, Int64, String, Map, Json, Struct
+
+trips_today = Field(name="trips_today", dtype=Int64)
+rating = Field(name="rating", dtype=Float32)
+```
+
+**Complex types** supported in fields:
+
+<Accordion title="Map, Json, and Struct types">
+| Type | Use when |
+|------|----------|
+| `Map` | Schema-free dictionary with string keys; keys/values are dynamic |
+| `Json` | Opaque JSON blob stored as a string; backends use native JSON types (`jsonb`, `VARIANT`) |
+| `Struct` | Schema-aware structured type with named, typed fields; stored in the registry |
+
+```python
+from feast.types import Int32, Float32, Map, Json, String, Struct
+
+validated_fv = FeatureView(
+    name="validated_features",
+    entities=[driver],
+    schema=[
+        Field(name="trips_today", dtype=Int64),
+        Field(name="rating", dtype=Float32),
+        Field(name="preferences", dtype=Map),
+        Field(name="config", dtype=Json),
+        Field(name="address", dtype=Struct({"street": String, "city": String, "zip": Int32})),
+    ],
+    source=my_source,
+    enable_validation=True,
+)
+```
+</Accordion>
+
+## Entity aliasing
+
+Use `.with_name()` and `.with_join_key_map()` to reuse a feature view with different entity column names — for example, when the same logical entity plays multiple roles:
+
+```python
+from location_stats_feature_view import location_stats_fv
+from feast import FeatureService
+
+temperatures_fs = FeatureService(
+    name="temperatures",
+    features=[
+        location_stats_fv
+            .with_name("origin_stats")
+            .with_join_key_map({"location_id": "origin_id"}),
+        location_stats_fv
+            .with_name("destination_stats")
+            .with_join_key_map({"location_id": "destination_id"}),
+    ],
+)
+```
+
+## Feature inferencing
+
+If `schema` is omitted, Feast infers feature columns from the underlying data source at `feast apply` time. Each non-entity, non-timestamp column becomes a `Field` with the name and type of the source column.
+
+## Schema validation
+
+Set `enable_validation=True` to have Feast verify schema consistency during materialization and historical retrieval:
+
+- Missing declared columns raise a `ValueError`
+- Type mismatches are logged as warnings but do not block execution
+
+This works across `FeatureView`, `BatchFeatureView`, and `StreamFeatureView`.
+
+## \[Alpha] Feature view versioning
+
+Every time `feast apply` detects a schema or UDF change, Feast saves a versioned snapshot. You can pin to a specific version using the `version` parameter:
+
+```python
+driver_stats = FeatureView(
+    name="driver_stats",
+    entities=[driver],
+    schema=[...],
+    source=my_source,
+    version="v2",  # Reverts the active definition to the v2 snapshot
+)
+```
+
+Version-qualified reads in feature references use `@v<N>` syntax:
+
+```python
+online_features = fs.get_online_features(
+    features=[
+        "drivers_activity@v2:trips_today",     # specific version
+        "drivers_activity@latest:trips_today", # explicit latest
+    ],
+    entity_rows=[{"driver": "driver_1001"}],
+)
+```
+
+<Note>
+Version-qualified reads require `enable_online_feature_view_versioning: true` in your registry config and are currently only supported on the SQLite online store.
+</Note>
+
+---
+
+## \[Alpha] `OnDemandFeatureView`
+
+On-demand feature views let you define Python transformation logic that runs on existing features and request-time data to produce new features. Transformations execute in both the historical and online retrieval paths.
+
+Use the `@on_demand_feature_view` decorator to register the transformation:
+
+```python
+import pandas as pd
+from feast import Field, RequestSource
+from feast.on_demand_feature_view import on_demand_feature_view
+from feast.types import Float64, PrimitiveFeastType
+
+# Request-time data: fields only available at inference time
+input_request = RequestSource(
+    name="vals_to_add",
+    schema=[
+        Field(name="val_to_add", dtype=PrimitiveFeastType.INT64),
+        Field(name="val_to_add_2", dtype=PrimitiveFeastType.INT64),
+    ],
+)
+
+# Transformation combining a batch feature view with request-time inputs
+@on_demand_feature_view(
+    sources=[
+        driver_hourly_stats_view,
+        input_request,
+    ],
+    schema=[
+        Field(name="conv_rate_plus_val1", dtype=Float64),
+        Field(name="conv_rate_plus_val2", dtype=Float64),
+    ],
+)
+def transformed_conv_rate(features_df: pd.DataFrame) -> pd.DataFrame:
+    df = pd.DataFrame()
+    df["conv_rate_plus_val1"] = features_df["conv_rate"] + features_df["val_to_add"]
+    df["conv_rate_plus_val2"] = features_df["conv_rate"] + features_df["val_to_add_2"]
+    return df
+```
+
+### Typical on-demand workflow
+
+<Steps>
+  <Step title="Generate training data">
+    Call `get_historical_features` to produce a training dataframe from the offline store.
+  </Step>
+  <Step title="Iterate in a notebook">
+    Experiment with feature engineering transformations in Pandas on a local dataset.
+  </Step>
+  <Step title="Register the transformation">
+    Copy the transformation logic into an `@on_demand_feature_view` and commit to a dev branch of your feature repository.
+  </Step>
+  <Step title="Validate offline">
+    Run `get_historical_features` on a small dataset to confirm the transformation produces expected output.
+  </Step>
+  <Step title="Validate online">
+    Call `get_online_features` on the dev branch to verify real-time output.
+  </Step>
+  <Step title="Promote to production">
+    Submit a pull request to staging/prod branches to impact production traffic.
+  </Step>
+</Steps>
+
+---
+
+## \[Alpha] `StreamFeatureView`
+
+A `StreamFeatureView` extends a regular feature view with **both a stream and a batch data source**. Use it when a streaming source (Kafka, Kinesis) is available to provide fresh features in an online setting.
+
+Supported compute engines: **LocalComputeEngine**, **SparkComputeEngine**.
+
+```python
+from datetime import timedelta
+from feast import Field, FileSource, KafkaSource, stream_feature_view
+from feast.data_format import JsonFormat
+from feast.types import Float32
+
+driver_stats_batch_source = FileSource(
+    name="driver_stats_source",
+    path="data/driver_stats.parquet",
+    timestamp_field="event_timestamp",
+)
+
+driver_stats_stream_source = KafkaSource(
+    name="driver_stats_stream",
+    kafka_bootstrap_servers="localhost:9092",
+    topic="drivers",
+    timestamp_field="event_timestamp",
+    batch_source=driver_stats_batch_source,
+    message_format=JsonFormat(
+        schema_json="driver_id integer, event_timestamp timestamp, conv_rate double, acc_rate double, created timestamp"
+    ),
+    watermark_delay_threshold=timedelta(minutes=5),
+)
+
+@stream_feature_view(
+    entities=[driver],
+    ttl=timedelta(seconds=8640000000),
+    mode="spark",
+    schema=[
+        Field(name="conv_percentage", dtype=Float32),
+        Field(name="acc_percentage", dtype=Float32),
+    ],
+    timestamp_field="event_timestamp",
+    online=True,
+    source=driver_stats_stream_source,
+)
+def driver_hourly_stats_stream(df: DataFrame):
+    from pyspark.sql.functions import col
+
+    return (
+        df.withColumn("conv_percentage", col("conv_rate") * 100.0)
+        .withColumn("acc_percentage", col("acc_rate") * 100.0)
+        .drop("conv_rate", "acc_rate")
+    )
+```
+
+### Key capabilities
+
+<CardGroup cols={2}>
+  <Card title="Real-time feature generation" icon="bolt">
+    Features are continuously updated as new events arrive from the stream source.
+  </Card>
+  <Card title="Transformations" icon="code">
+    Apply UDF or `feature_transformation` logic to raw stream data.
+  </Card>
+  <Card title="Aggregations" icon="sigma">
+    Define time-windowed aggregations (`sum`, `avg`) over event-timestamped data.
+  </Card>
+  <Card title="Tiling optimization" icon="layer-group">
+    Enable `enable_tiling=True` for efficient pre-aggregation with correct merging semantics for holistic aggregations like `avg` and `std`.
+  </Card>
+</CardGroup>
+
+---
+
+## `BatchFeatureView`
+
+`BatchFeatureView` extends `FeatureView` to support **composable batch feature pipelines** — including derived views built on top of other feature views.
+
+Supported compute engines: **LocalComputeEngine**, **SparkComputeEngine**.
+
+```python
+from feast import BatchFeatureView, Field, FileSource
+from feast.aggregation import Aggregation
+from feast.types import Float32, Int32
+from datetime import timedelta
+
+source = FileSource(
+    path="s3://bucket/path/data.parquet",
+    timestamp_field="event_timestamp",
+    created_timestamp_column="created",
+)
+
+driver_fv = BatchFeatureView(
+    name="driver_hourly_stats",
+    entities=["driver_id"],
+    schema=[
+        Field(name="driver_id", dtype=Int32),
+        Field(name="conv_rate", dtype=Float32),
+    ],
+    aggregations=[
+        Aggregation(
+            column="conv_rate",
+            function="sum",
+            time_window=timedelta(days=1),
+            name="total_conv_rate_1d",
+        ),
+    ],
+    source=source,
+)
+```
+
+### Derived feature views
+
+Chain a `BatchFeatureView` on top of another feature view using a UDF transformation. A `sink_source` is required when the source is another feature view:
+
+```python
+from pyspark.sql import DataFrame
+
+def transform(df: DataFrame) -> DataFrame:
+    return df.withColumn("conv_rate", df["conv_rate"] * 2)
+
+daily_driver_stats = BatchFeatureView(
+    name="daily_driver_stats",
+    entities=["driver_id"],
+    schema=[
+        Field(name="driver_id", dtype=Int32),
+        Field(name="conv_rate", dtype=Float32),
+    ],
+    udf=transform,
+    source=driver_fv,  # Source is another FeatureView
+    sink_source=FileSource(
+        name="daily_driver_stats_sink",
+        path="s3://bucket/daily_stats/",
+        file_format="parquet",
+        timestamp_field="event_timestamp",
+        created_timestamp_column="created",
+    ),
+)
+```
+
+<Warning>
+`sink_source` is **required** when chaining views (i.e. when `source` is another `FeatureView` or a list of them). Feast uses it as the materialization target for the derived data.
+</Warning>
+
+---
+
+## Summary
+
+<CardGroup cols={2}>
+  <Card title="FeatureView" icon="table" href="/concepts/feature-views">
+    Define features backed by a batch data source. The most common type.
+  </Card>
+  <Card title="OnDemandFeatureView" icon="wand-magic-sparkles" href="/concepts/feature-views">
+    Apply Python transformations at retrieval time using existing features and request-time data.
+  </Card>
+  <Card title="StreamFeatureView" icon="wave-sine" href="/concepts/feature-views">
+    Combine a stream and batch source for continuously updated, fresh features.
+  </Card>
+  <Card title="BatchFeatureView" icon="gears" href="/concepts/feature-views">
+    Compose batch pipelines with transformations, aggregations, and chained views.
+  </Card>
+</CardGroup>

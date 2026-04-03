@@ -1,0 +1,356 @@
+---
+title: "Offline and Online Stores"
+description: "Understand the difference between Feast's offline store (for training data and batch scoring) and online store (for low-latency real-time inference), and how to configure each."
+---
+
+Feast maintains two distinct storage layers that serve different parts of the machine learning lifecycle:
+
+| | Offline Store | Online Store |
+|---|---|---|
+| **Purpose** | Historical feature retrieval for training and batch scoring | Low-latency feature serving for real-time inference |
+| **Access pattern** | Large scans, point-in-time joins | Single-entity key lookups |
+| **Data freshness** | Historical (days/weeks/months of history) | Latest feature values only |
+| **Primary API** | `get_historical_features()` | `get_online_features()` |
+| **Populated by** | Reading directly from data sources | `materialize()` or push sources |
+
+<Info>
+You do not need both stores. If you only do batch scoring, the offline store alone is sufficient. If you need real-time inference, you also need an online store populated via materialization or push.
+</Info>
+
+---
+
+## Offline store
+
+The offline store processes historical feature data for training datasets and batch scoring jobs. It performs point-in-time correct joins across one or more feature views.
+
+### Core implementations
+
+<Tabs>
+  <Tab title="Dask (default)">
+    File-based offline store backed by Apache Dask. Good for local development and small-to-medium datasets stored as Parquet files.
+
+    ```yaml
+    # feature_store.yaml
+    project: my_feature_repo
+    registry: data/registry.db
+    provider: local
+    offline_store:
+      type: file
+    online_store:
+      type: sqlite
+      path: data/online_store.db
+    ```
+  </Tab>
+  <Tab title="BigQuery">
+    Google BigQuery offline store. All joins run inside BigQuery. Requires `feast[gcp]`.
+
+    ```yaml
+    # feature_store.yaml
+    project: my_feature_repo
+    registry: gs://my-bucket/data/registry.db
+    provider: gcp
+    offline_store:
+      type: bigquery
+      dataset: feast_bq_dataset
+    online_store:
+      type: datastore
+    ```
+  </Tab>
+  <Tab title="Snowflake">
+    Snowflake offline store. Requires `feast[snowflake]`.
+
+    ```yaml
+    # feature_store.yaml
+    project: my_feature_repo
+    registry: data/registry.db
+    provider: local
+    offline_store:
+      type: snowflake.offline
+      account: my_account
+      user: my_user
+      password: my_password
+      role: MY_ROLE
+      warehouse: MY_WAREHOUSE
+      database: FEAST
+      schema_: PUBLIC
+    online_store:
+      type: snowflake.online
+      account: my_account
+      user: my_user
+      password: my_password
+      role: MY_ROLE
+      warehouse: MY_WAREHOUSE
+      database: FEAST
+      schema_: PUBLIC
+    ```
+  </Tab>
+  <Tab title="Redshift">
+    Amazon Redshift offline store. Requires `feast[aws]`.
+
+    ```yaml
+    # feature_store.yaml
+    project: my_feature_repo
+    registry:
+      path: s3://my-bucket/registry.pb
+      s3_additional_kwargs:
+        ServerSideEncryption: AES256
+    provider: aws
+    offline_store:
+      type: redshift
+      region: us-west-2
+      cluster_id: feast-cluster
+      database: feast
+      user: feast_user
+      s3_staging_location: s3://my-bucket/redshift-staging
+      iam_role: arn:aws:iam::123456789012:role/FeastRole
+    online_store:
+      type: dynamodb
+      region: us-west-2
+    ```
+  </Tab>
+  <Tab title="DuckDB">
+    In-process analytical database. Great for local development on larger datasets than plain Dask.
+
+    ```yaml
+    # feature_store.yaml
+    project: my_feature_repo
+    registry: data/registry.db
+    provider: local
+    offline_store:
+      type: duckdb
+    online_store:
+      type: sqlite
+      path: data/online_store.db
+    ```
+  </Tab>
+  <Tab title="Spark">
+    Apache Spark offline store for distributed processing of large datasets. Community contribution.
+
+    ```yaml
+    # feature_store.yaml
+    project: my_feature_repo
+    registry: s3://my-bucket/registry.db
+    provider: local
+    offline_store:
+      type: spark
+      spark_conf:
+        spark.master: "local[*]"
+        spark.ui.enabled: "false"
+        spark.eventLog.enabled: "false"
+        spark.sql.catalogImplementation: "hive"
+        spark.sql.parser.quotedRegexColumnNames: "true"
+        spark.sql.session.timeZone: "UTC"
+    online_store:
+      type: sqlite
+      path: data/online_store.db
+    ```
+  </Tab>
+</Tabs>
+
+### Offline store functionality matrix
+
+| | Dask | BigQuery | Snowflake | Redshift | Postgres | Spark | Ray |
+|---|---|---|---|---|---|---|---|
+| `get_historical_features` | yes | yes | yes | yes | yes | yes | yes |
+| `pull_latest_from_table_or_query` | yes | yes | yes | yes | yes | yes | yes |
+| `offline_write_batch` | yes | yes | yes | yes | no | no | yes |
+| Export to dataframe | yes | yes | yes | yes | yes | yes | yes |
+| Export to SQL | no | yes | yes | yes | yes | no | no |
+| Export to data lake | no | no | yes | no | yes | no | yes |
+| Export to data warehouse | no | yes | yes | yes | yes | no | no |
+
+---
+
+## Online store
+
+The online store holds the latest feature values for each entity, ready for low-latency retrieval by real-time models. It is populated by running `feast materialize` or using push sources.
+
+### Core implementations
+
+<Tabs>
+  <Tab title="SQLite (default)">
+    Lightweight embedded database. Ideal for local development.
+
+    ```yaml
+    # feature_store.yaml
+    project: my_feature_repo
+    registry: data/registry.db
+    provider: local
+    offline_store:
+      type: file
+    online_store:
+      type: sqlite
+      path: data/online_store.db
+    ```
+  </Tab>
+  <Tab title="Redis">
+    High-performance in-memory store. The recommended choice for production deployments. Requires `feast[redis]`.
+
+    ```yaml
+    # feature_store.yaml
+    project: my_feature_repo
+    registry: data/registry.db
+    provider: local
+    online_store:
+      type: redis
+      connection_string: "localhost:6379"
+    ```
+
+    With TTL and cluster mode:
+
+    ```yaml
+    online_store:
+      type: redis
+      redis_type: redis_cluster
+      connection_string: "redis1:6379,redis2:6379,ssl=true,password=my_password"
+      key_ttl_seconds: 604800  # Expire entity keys after 7 days
+    ```
+  </Tab>
+  <Tab title="DynamoDB">
+    Amazon DynamoDB. Requires `feast[aws]`.
+
+    ```yaml
+    # feature_store.yaml
+    project: my_feature_repo
+    registry:
+      path: s3://my-bucket/registry.pb
+    provider: aws
+    online_store:
+      type: dynamodb
+      region: us-west-2
+    ```
+  </Tab>
+  <Tab title="Bigtable">
+    Google Cloud Bigtable. Requires `feast[gcp]`.
+
+    ```yaml
+    # feature_store.yaml
+    project: my_feature_repo
+    registry: gs://my-bucket/data/registry.db
+    provider: gcp
+    online_store:
+      type: bigtable
+      project_id: my-gcp-project
+      instance: feast-instance
+    ```
+  </Tab>
+  <Tab title="Postgres">
+    PostgreSQL online store. Community contribution. Requires `feast[postgres]`.
+
+    ```yaml
+    # feature_store.yaml
+    project: my_feature_repo
+    registry: data/registry.db
+    provider: local
+    online_store:
+      type: postgres
+      host: localhost
+      port: 5432
+      database: feast
+      db_schema: public
+      user: feast
+      password: feast
+    ```
+  </Tab>
+</Tabs>
+
+### Online store functionality matrix
+
+| | SQLite | Redis | DynamoDB | Snowflake | Postgres | Milvus |
+|---|---|---|---|---|---|---|
+| Write feature values | yes | yes | yes | yes | yes | yes |
+| Read feature values | yes | yes | yes | yes | yes | yes |
+| Readable by Python SDK | yes | yes | yes | yes | yes | yes |
+| Readable by Go SDK | yes | yes | no | no | no | no |
+| Readable by Java SDK | no | yes | no | no | no | no |
+| TTL support | no | yes | no | no | no | no |
+| Concurrent writes | no | yes | no | no | no | yes |
+| Vector search | no | no | no | no | no | yes |
+
+---
+
+## The registry
+
+The **registry** is a central metadata store that holds definitions of all Feast objects (feature views, entities, feature services, data sources). It is not a data store — it stores schema and configuration only.
+
+```yaml
+# Simple local registry
+registry: data/registry.db
+
+# Remote registry on GCS
+registry: gs://my-bucket/data/registry.db
+
+# Remote registry on S3
+registry: s3://my-bucket/registry.pb
+
+# Registry with SQL backend and versioning enabled
+registry:
+  registry_type: sql
+  path: postgresql://user:password@localhost:5432/feast
+  cache_ttl_seconds: 60
+  enable_online_feature_view_versioning: true
+```
+
+The registry is updated when you run `feast apply`. All SDK operations (retrieval, materialization) read from the registry to understand your feature definitions.
+
+---
+
+## Materialization
+
+**Materialization** is the process of loading feature values from the offline store into the online store, making them available for low-latency retrieval.
+
+<Steps>
+  <Step title="Define your feature views">
+    Create feature views with a batch data source and register them with `feast apply`.
+  </Step>
+  <Step title="Run materialization">
+    Use `materialize_incremental` to load the latest feature values into the online store.
+
+    ```python
+    from feast import FeatureStore
+    import datetime
+
+    store = FeatureStore(repo_path=".")
+    store.materialize_incremental(end_date=datetime.datetime.now())
+    ```
+
+    Or via the CLI:
+
+    ```bash
+    feast materialize-incremental $(date -u +"%Y-%m-%dT%H:%M:%S")
+    ```
+  </Step>
+  <Step title="Serve features">
+    Use `get_online_features` to retrieve the materialized values.
+
+    ```python
+    features = store.get_online_features(
+        features=["driver_activity:trips_today", "driver_activity:rating"],
+        entity_rows=[{"driver_id": 1001}],
+    ).to_dict()
+    ```
+  </Step>
+</Steps>
+
+<Tip>
+Use `materialize_incremental` in production to only process new data since the last materialization run. Schedule it via Airflow or another orchestrator for continuous freshness.
+</Tip>
+
+---
+
+## Choosing the right configuration
+
+<CardGroup cols={2}>
+  <Card title="Local development" icon="laptop-code">
+    Use `FileSource` + Dask offline store + SQLite online store. Zero infrastructure to set up. Run `feast init` to get started instantly.
+  </Card>
+  <Card title="GCP production" icon="google">
+    Use `BigQuerySource` + BigQuery offline store + Redis or Bigtable online store. Run `feast init -t gcp` for a ready-made template.
+  </Card>
+  <Card title="AWS production" icon="aws">
+    Use `RedshiftSource` + Redshift offline store + DynamoDB online store. Run `feast init -t aws` for a ready-made template.
+  </Card>
+  <Card title="Snowflake production" icon="snowflake">
+    Use `SnowflakeSource` + Snowflake offline + Snowflake online for an all-Snowflake stack. Run `feast init -t snowflake`.
+  </Card>
+</CardGroup>

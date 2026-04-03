@@ -1,0 +1,712 @@
+---
+title: "FeatureStore API"
+description: "Complete API reference for the FeatureStore class — the primary SDK entrypoint for defining, registering, and retrieving features in Feast."
+---
+
+The `FeatureStore` class is the central object in the Feast Python SDK. It manages connections to the registry, the offline store, and the online store, and exposes all operations needed to register feature definitions, materialize data, and serve features.
+
+```python
+from feast import FeatureStore
+```
+
+---
+
+## Constructor
+
+<Accordion title="FeatureStore.__init__">
+
+```python
+FeatureStore(
+    repo_path: Optional[str] = None,
+    config: Optional[RepoConfig] = None,
+    fs_yaml_file: Optional[Path] = None,
+)
+```
+
+Creates a `FeatureStore` object. All parameters are optional; if none are provided, Feast looks for a `feature_store.yaml` file in the current working directory.
+
+<ParamField path="repo_path" type="Optional[str]">
+  Path to the feature repository directory. Defaults to the current working directory. Feast resolves `feature_store.yaml` relative to this path.
+</ParamField>
+
+<ParamField path="config" type="Optional[RepoConfig]">
+  A `RepoConfig` object that programmatically configures the feature store. Cannot be combined with `fs_yaml_file`.
+</ParamField>
+
+<ParamField path="fs_yaml_file" type="Optional[Path]">
+  Explicit path to a `feature_store.yaml` file. Overrides the default resolution under `repo_path`. Cannot be combined with `config`.
+</ParamField>
+
+**Raises:** `ValueError` if both `fs_yaml_file` and `config` are provided.
+
+```python
+from feast import FeatureStore
+
+# From a repo directory containing feature_store.yaml
+store = FeatureStore(repo_path="feature_repo/")
+
+# Programmatic configuration
+from feast.repo_config import RepoConfig, RegistryConfig
+config = RepoConfig(
+    project="my_project",
+    registry=RegistryConfig(path="data/registry.db"),
+    provider="local",
+    online_store={"type": "sqlite", "path": "data/online_store.db"},
+)
+store = FeatureStore(config=config)
+```
+
+</Accordion>
+
+---
+
+## Registering Objects
+
+<Accordion title="apply">
+
+```python
+apply(
+    objects: Union[
+        Project,
+        DataSource,
+        Entity,
+        FeatureView,
+        OnDemandFeatureView,
+        BatchFeatureView,
+        StreamFeatureView,
+        FeatureService,
+        ValidationReference,
+        Permission,
+        List[FeastObject],
+    ],
+    objects_to_delete: Optional[List[FeastObject]] = None,
+    partial: bool = True,
+    skip_feature_view_validation: bool = False,
+    no_promote: bool = False,
+) -> None
+```
+
+Registers one or more Feast objects (entities, feature views, feature services, permissions, etc.) to the metadata store and updates related infrastructure (e.g., creates tables in the online store). All operations are idempotent.
+
+<Note>
+`apply` does **not** delete objects that are absent from the provided list. Use `delete_feature_view()`, `delete_feature_service()`, or the `objects_to_delete` parameter with `partial=False` to remove objects.
+</Note>
+
+<ParamField path="objects" type="Union[FeastObject, List[FeastObject]]" required>
+  A single Feast object or a list of objects to register. Supported types: `Project`, `DataSource`, `Entity`, `FeatureView`, `OnDemandFeatureView`, `BatchFeatureView`, `StreamFeatureView`, `FeatureService`, `ValidationReference`, `Permission`.
+</ParamField>
+
+<ParamField path="objects_to_delete" type="Optional[List[FeastObject]]">
+  Objects to delete from the registry. Only acted upon when `partial=False`.
+</ParamField>
+
+<ParamField path="partial" type="bool">
+  When `True` (default), only the objects in `objects` are applied. When `False`, objects in `objects_to_delete` are also removed from the registry and their cloud resources are torn down.
+</ParamField>
+
+<ParamField path="skip_feature_view_validation" type="bool">
+  Skip schema validation of feature views. Use with caution. Default is `False`.
+</ParamField>
+
+<ParamField path="no_promote" type="bool">
+  If `True`, newly registered feature view versions are not promoted to active. Default is `False`.
+</ParamField>
+
+```python
+from feast import FeatureStore, Entity, FeatureView, FileSource
+from feast.types import Int64, Float32
+from feast.field import Field
+from datetime import timedelta
+
+store = FeatureStore(repo_path="feature_repo/")
+
+driver = Entity(name="driver_id", description="Driver identifier")
+
+driver_stats_source = FileSource(
+    path="data/driver_stats.parquet",
+    timestamp_field="event_timestamp",
+)
+
+driver_stats_fv = FeatureView(
+    name="driver_hourly_stats",
+    entities=[driver],
+    ttl=timedelta(days=1),
+    schema=[
+        Field(name="conv_rate", dtype=Float32),
+        Field(name="acc_rate", dtype=Float32),
+        Field(name="avg_daily_trips", dtype=Int64),
+    ],
+    source=driver_stats_source,
+)
+
+store.apply([driver, driver_stats_fv])
+```
+
+</Accordion>
+
+---
+
+## Training Data Retrieval
+
+<Accordion title="get_historical_features">
+
+```python
+get_historical_features(
+    entity_df: Optional[Union[pd.DataFrame, str]] = None,
+    features: Union[List[str], FeatureService] = [],
+    full_feature_names: bool = False,
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None,
+) -> RetrievalJob
+```
+
+Retrieves historical feature values for training or batch scoring. Performs a **point-in-time correct** join between the entity dataframe and the offline store, preventing data leakage.
+
+Each feature view is joined using all its configured entities. Alternatively, features can be retrieved for a time range without an entity dataframe by supplying `start_date` and `end_date`.
+
+<Warning>
+You cannot supply both `entity_df` and `start_date`/`end_date` in the same call.
+</Warning>
+
+<ParamField path="entity_df" type="Optional[Union[pd.DataFrame, str]]">
+  A Pandas DataFrame or a SQL query string containing entity columns and an `event_timestamp` column. The timestamp drives point-in-time correctness. If omitted, `start_date` and `end_date` are used instead.
+</ParamField>
+
+<ParamField path="features" type="Union[List[str], FeatureService]" required>
+  Features to retrieve. Accepts either a list of `"feature_view:feature"` string references (e.g., `"driver_hourly_stats:conv_rate"`) or a `FeatureService` object.
+</ParamField>
+
+<ParamField path="full_feature_names" type="bool">
+  When `True`, output columns are prefixed with the feature view name using double-underscore notation: `"driver_hourly_stats__conv_rate"`. Default is `False`.
+</ParamField>
+
+<ParamField path="start_date" type="Optional[datetime]">
+  Lower bound of the time range when retrieving features without `entity_df`. Required if `entity_df` is not provided.
+</ParamField>
+
+<ParamField path="end_date" type="Optional[datetime]">
+  Upper bound of the time range. Required when `entity_df` is not provided. Defaults to the current time.
+</ParamField>
+
+<ResponseField name="returns" type="RetrievalJob">
+  A lazy `RetrievalJob`. Call `.to_df()` to get a Pandas DataFrame or `.to_arrow()` for a PyArrow Table.
+</ResponseField>
+
+<CodeGroup>
+
+```python Entity DataFrame
+import pandas as pd
+from datetime import datetime
+from feast import FeatureStore
+
+store = FeatureStore(repo_path="feature_repo/")
+
+entity_df = pd.DataFrame({
+    "driver_id": [1001, 1002, 1003],
+    "event_timestamp": [
+        datetime(2023, 6, 1, 10, 0, 0),
+        datetime(2023, 6, 1, 11, 0, 0),
+        datetime(2023, 6, 1, 12, 0, 0),
+    ],
+})
+
+job = store.get_historical_features(
+    entity_df=entity_df,
+    features=[
+        "driver_hourly_stats:conv_rate",
+        "driver_hourly_stats:acc_rate",
+        "driver_hourly_stats:avg_daily_trips",
+    ],
+)
+
+training_df = job.to_df()
+```
+
+```python FeatureService
+from feast import FeatureStore
+
+store = FeatureStore(repo_path="feature_repo/")
+svc = store.get_feature_service("driver_activity_v1")
+
+job = store.get_historical_features(
+    entity_df=entity_df,
+    features=svc,
+    full_feature_names=True,
+)
+
+training_df = job.to_df()
+```
+
+```python Time Range (no entity_df)
+from datetime import datetime
+from feast import FeatureStore
+
+store = FeatureStore(repo_path="feature_repo/")
+
+job = store.get_historical_features(
+    features=["driver_hourly_stats:conv_rate"],
+    start_date=datetime(2023, 1, 1),
+    end_date=datetime(2023, 6, 1),
+)
+
+df = job.to_df()
+```
+
+</CodeGroup>
+
+</Accordion>
+
+---
+
+## Online Inference
+
+<Accordion title="get_online_features">
+
+```python
+get_online_features(
+    features: Union[List[str], FeatureService],
+    entity_rows: Union[
+        List[Dict[str, Any]],
+        Mapping[str, Union[Sequence[Any], Sequence[Value], RepeatedValue]],
+    ],
+    full_feature_names: bool = False,
+    include_feature_view_version_metadata: bool = False,
+) -> OnlineResponse
+```
+
+Retrieves the latest feature values from the online store for low-latency inference. The registry is cached in memory and refreshed based on the configured TTL.
+
+<Tip>
+Call `store.refresh_registry()` before the cache TTL expires to avoid synchronous downloads during `get_online_features` calls.
+</Tip>
+
+<ParamField path="features" type="Union[List[str], FeatureService]" required>
+  Features to retrieve. Accepts `"feature_view:feature"` string references or a `FeatureService` object.
+</ParamField>
+
+<ParamField path="entity_rows" type="Union[List[Dict[str, Any]], Mapping[str, Sequence]]" required>
+  A list of dictionaries where each dictionary maps entity names to entity values. Example: `[{"driver_id": 1001}, {"driver_id": 1002}]`.
+</ParamField>
+
+<ParamField path="full_feature_names" type="bool">
+  When `True`, feature names are prefixed with the feature view name: `"driver_hourly_stats__conv_rate"`. Default is `False`.
+</ParamField>
+
+<ParamField path="include_feature_view_version_metadata" type="bool">
+  When `True`, the response includes version metadata for each feature view. Default is `False`.
+</ParamField>
+
+<ResponseField name="returns" type="OnlineResponse">
+  An `OnlineResponse` object. Call `.to_dict()` for a Python dictionary or `.to_df()` for a Pandas DataFrame.
+</ResponseField>
+
+```python
+from feast import FeatureStore
+
+store = FeatureStore(repo_path="feature_repo/")
+
+response = store.get_online_features(
+    features=[
+        "driver_hourly_stats:conv_rate",
+        "driver_hourly_stats:acc_rate",
+        "driver_hourly_stats:avg_daily_trips",
+    ],
+    entity_rows=[
+        {"driver_id": 1001},
+        {"driver_id": 1002},
+        {"driver_id": 1003},
+    ],
+)
+
+feature_dict = response.to_dict()
+# {"driver_id": [1001, 1002, 1003], "conv_rate": [0.87, 0.63, 0.92], ...}
+```
+
+</Accordion>
+
+---
+
+## Materialization
+
+<Accordion title="materialize">
+
+```python
+materialize(
+    start_date: datetime,
+    end_date: datetime,
+    feature_views: Optional[List[str]] = None,
+    disable_event_timestamp: bool = False,
+    full_feature_names: bool = False,
+    version: Optional[str] = None,
+) -> None
+```
+
+Loads feature data from the offline store into the online store for the given time interval. If no `feature_views` are specified, all feature views with `online=True` are materialized.
+
+<ParamField path="start_date" type="datetime" required>
+  Inclusive start of the time range to materialize.
+</ParamField>
+
+<ParamField path="end_date" type="datetime" required>
+  Inclusive end of the time range to materialize.
+</ParamField>
+
+<ParamField path="feature_views" type="Optional[List[str]]">
+  Names of specific feature views to materialize. If omitted, all online-enabled feature views are materialized.
+</ParamField>
+
+<ParamField path="disable_event_timestamp" type="bool">
+  When `True`, materializes all available data using the current datetime as the event timestamp instead of source event timestamps. Default is `False`.
+</ParamField>
+
+<ParamField path="full_feature_names" type="bool">
+  When `True`, feature names are prefixed with the feature view name. Default is `False`.
+</ParamField>
+
+<ParamField path="version" type="Optional[str]">
+  Version string to materialize (e.g., `"v2"`). Requires `feature_views` to contain exactly one name and `enable_online_feature_view_versioning: true` in the registry config.
+</ParamField>
+
+```python
+from feast import FeatureStore
+from datetime import datetime, timedelta, timezone
+
+store = FeatureStore(repo_path="feature_repo/")
+
+now = datetime.now(tz=timezone.utc)
+store.materialize(
+    start_date=now - timedelta(hours=3),
+    end_date=now - timedelta(minutes=10),
+)
+
+# Materialize only specific feature views
+store.materialize(
+    start_date=now - timedelta(days=7),
+    end_date=now,
+    feature_views=["driver_hourly_stats"],
+)
+```
+
+</Accordion>
+
+<Accordion title="materialize_incremental">
+
+```python
+materialize_incremental(
+    end_date: datetime,
+    feature_views: Optional[List[str]] = None,
+    full_feature_names: bool = False,
+    version: Optional[str] = None,
+) -> None
+```
+
+Materializes new data from the offline store since the last materialization run. The start time is inferred from the most recent materialization end time stored in the registry, or `now - ttl` if no prior run exists.
+
+**Raises:** `Exception` if a feature view has no TTL and has never been materialized before.
+
+<ParamField path="end_date" type="datetime" required>
+  Upper bound for the data to materialize.
+</ParamField>
+
+<ParamField path="feature_views" type="Optional[List[str]]">
+  Names of specific feature views to materialize incrementally. Defaults to all online-enabled feature views.
+</ParamField>
+
+<ParamField path="full_feature_names" type="bool">
+  Prefix feature names with the feature view name. Default is `False`.
+</ParamField>
+
+<ParamField path="version" type="Optional[str]">
+  Version string (e.g., `"v2"`). Requires `feature_views` to contain exactly one name and `enable_online_feature_view_versioning: true`.
+</ParamField>
+
+```python
+from feast import FeatureStore
+from datetime import datetime, timedelta, timezone
+
+store = FeatureStore(repo_path="feature_repo/")
+
+# Materialize everything up to 5 minutes ago
+store.materialize_incremental(
+    end_date=datetime.now(tz=timezone.utc) - timedelta(minutes=5)
+)
+```
+
+</Accordion>
+
+---
+
+## Push / Streaming Ingest
+
+<Accordion title="push">
+
+```python
+push(
+    push_source_name: str,
+    df: pd.DataFrame,
+    allow_registry_cache: bool = True,
+    to: PushMode = PushMode.ONLINE,
+    transform_on_write: bool = True,
+) -> None
+```
+
+Pushes a DataFrame to a named `PushSource`, updating all feature views that reference it as a stream source. Used for real-time feature updates from application code.
+
+<ParamField path="push_source_name" type="str" required>
+  The name of the `PushSource` defined in the feature repository.
+</ParamField>
+
+<ParamField path="df" type="pd.DataFrame" required>
+  The data to push. Columns must include entity join key columns and feature columns.
+</ParamField>
+
+<ParamField path="allow_registry_cache" type="bool">
+  Whether to use a cached registry when resolving the push source to feature views. Default is `True`.
+</ParamField>
+
+<ParamField path="to" type="PushMode">
+  Destination store. Options: `PushMode.ONLINE` (default), `PushMode.OFFLINE`, or `PushMode.ONLINE_AND_OFFLINE`.
+</ParamField>
+
+<ParamField path="transform_on_write" type="bool">
+  Apply any configured on-demand transformations before writing. Default is `True`.
+</ParamField>
+
+```python
+import pandas as pd
+from feast import FeatureStore
+from feast.data_source import PushMode
+
+store = FeatureStore(repo_path="feature_repo/")
+
+new_data = pd.DataFrame({
+    "driver_id": [1001, 1002],
+    "conv_rate": [0.92, 0.74],
+    "acc_rate": [0.88, 0.65],
+    "event_timestamp": pd.Timestamp.now(tz="UTC"),
+})
+
+store.push(
+    push_source_name="driver_stats_push_source",
+    df=new_data,
+    to=PushMode.ONLINE_AND_OFFLINE,
+)
+```
+
+</Accordion>
+
+---
+
+## Vector / Document Search
+
+<Accordion title="retrieve_online_documents_v2">
+
+```python
+retrieve_online_documents_v2(
+    features: List[str],
+    top_k: int,
+    query: Optional[List[float]] = None,
+    query_string: Optional[str] = None,
+    distance_metric: Optional[str] = "L2",
+    query_image_bytes: Optional[bytes] = None,
+    query_image_model: Optional[str] = "resnet34",
+    combine_with_text: bool = False,
+    text_weight: float = 0.5,
+    image_weight: float = 0.5,
+    combine_strategy: str = "weighted_sum",
+    include_feature_view_version_metadata: bool = False,
+) -> OnlineResponse
+```
+
+Retrieves the top-k most similar documents from the online vector store. Supports dense vector search, text (sparse) search, image search, and multi-modal combinations.
+
+<Note>
+All features must belong to a single feature view. Multi-feature-view document retrieval is not supported.
+</Note>
+
+<ParamField path="features" type="List[str]" required>
+  Feature references in `"feature_view:feature"` format, e.g., `["documents:embedding", "documents:title"]`.
+</ParamField>
+
+<ParamField path="top_k" type="int" required>
+  Number of nearest neighbors to retrieve.
+</ParamField>
+
+<ParamField path="query" type="Optional[List[float]]">
+  A pre-computed dense embedding vector (list of floats). Mutually exclusive with `query_image_bytes` unless `combine_with_text=True`.
+</ParamField>
+
+<ParamField path="query_string" type="Optional[str]">
+  A text string for sparse/full-text search (alternative to a pre-computed embedding).
+</ParamField>
+
+<ParamField path="distance_metric" type="Optional[str]">
+  The distance metric: `"L2"` (default), `"COSINE"`, or `"IP"` (inner product). Overridden by vector field metadata if configured.
+</ParamField>
+
+<ParamField path="query_image_bytes" type="Optional[bytes]">
+  Raw image bytes for image similarity search. Requires `feast[image]` extras.
+</ParamField>
+
+<ParamField path="query_image_model" type="Optional[str]">
+  Model name for image feature extraction. Default is `"resnet34"`.
+</ParamField>
+
+<ParamField path="combine_with_text" type="bool">
+  When `True`, combines text and image embeddings into a single query vector. Requires both `query` and `query_image_bytes`.
+</ParamField>
+
+<ParamField path="text_weight" type="float">
+  Weight for the text embedding when `combine_with_text=True`. Must sum to `1.0` with `image_weight`. Default is `0.5`.
+</ParamField>
+
+<ParamField path="image_weight" type="float">
+  Weight for the image embedding when `combine_with_text=True`. Must sum to `1.0` with `text_weight`. Default is `0.5`.
+</ParamField>
+
+<ParamField path="combine_strategy" type="str">
+  Strategy for combining embeddings. Options: `"weighted_sum"` (default), `"concatenate"`, `"average"`.
+</ParamField>
+
+<ResponseField name="returns" type="OnlineResponse">
+  An `OnlineResponse` containing the top-k matched documents, their entity keys, feature values, and a `distance` field.
+</ResponseField>
+
+<CodeGroup>
+
+```python Dense Vector Search
+from feast import FeatureStore
+
+store = FeatureStore(repo_path="feature_repo/")
+
+query_embedding = [0.12, 0.45, 0.78, ...]  # pre-computed vector
+
+results = store.retrieve_online_documents_v2(
+    features=["documents:embedding", "documents:title", "documents:body"],
+    query=query_embedding,
+    top_k=5,
+    distance_metric="COSINE",
+)
+
+df = results.to_df()
+# Columns: embedding, title, body, distance, document_id
+```
+
+```python Multi-modal Search
+from feast import FeatureStore
+
+store = FeatureStore(repo_path="feature_repo/")
+
+with open("query_image.jpg", "rb") as f:
+    image_bytes = f.read()
+
+results = store.retrieve_online_documents_v2(
+    features=["images:embedding", "images:filename"],
+    query=[0.1, 0.2, 0.3],          # text embedding
+    query_image_bytes=image_bytes,   # image embedding
+    combine_with_text=True,
+    text_weight=0.3,
+    image_weight=0.7,
+    top_k=10,
+)
+```
+
+</CodeGroup>
+
+</Accordion>
+
+---
+
+## Discovery
+
+<Accordion title="get_feature_service">
+
+```python
+get_feature_service(
+    name: str,
+    allow_cache: bool = False,
+) -> FeatureService
+```
+
+Retrieves a registered feature service by name.
+
+<ParamField path="name" type="str" required>
+  The name of the feature service to retrieve.
+</ParamField>
+
+<ParamField path="allow_cache" type="bool">
+  Whether to allow returning the result from a cached registry. Default is `False`.
+</ParamField>
+
+<ResponseField name="returns" type="FeatureService">
+  The named `FeatureService` object.
+</ResponseField>
+
+**Raises:** `FeatureServiceNotFoundException` if the service does not exist.
+
+```python
+from feast import FeatureStore
+
+store = FeatureStore(repo_path="feature_repo/")
+svc = store.get_feature_service("driver_activity_v1")
+print(svc.name)  # "driver_activity_v1"
+```
+
+</Accordion>
+
+<Accordion title="list_feature_views">
+
+```python
+list_feature_views(
+    allow_cache: bool = False,
+    tags: Optional[dict[str, str]] = None,
+) -> List[FeatureView]
+```
+
+Returns all registered `FeatureView` objects from the registry.
+
+<ParamField path="allow_cache" type="bool">
+  Return results from cached registry. Default is `False`.
+</ParamField>
+
+<ParamField path="tags" type="Optional[dict[str, str]]">
+  Filter feature views by metadata tags. Only views where all provided key-value pairs match are returned.
+</ParamField>
+
+<ResponseField name="returns" type="List[FeatureView]">
+  A list of `FeatureView` objects.
+</ResponseField>
+
+```python
+from feast import FeatureStore
+
+store = FeatureStore(repo_path="feature_repo/")
+
+# List all feature views
+all_fvs = store.list_feature_views()
+
+# Filter by tag
+team_fvs = store.list_feature_views(tags={"team": "pricing"})
+for fv in team_fvs:
+    print(fv.name, fv.ttl)
+```
+
+</Accordion>
+
+<Accordion title="Additional discovery methods">
+
+| Method | Signature | Returns |
+|---|---|---|
+| `get_feature_view` | `(name: str, allow_registry_cache: bool = False)` | `FeatureView` |
+| `get_entity` | `(name: str, allow_registry_cache: bool = False)` | `Entity` |
+| `get_stream_feature_view` | `(name: str, allow_registry_cache: bool = False)` | `StreamFeatureView` |
+| `get_on_demand_feature_view` | `(name: str, allow_registry_cache: bool = False)` | `OnDemandFeatureView` |
+| `list_entities` | `(allow_cache: bool = False, tags: Optional[dict] = None)` | `List[Entity]` |
+| `list_feature_services` | `(tags: Optional[dict] = None)` | `List[FeatureService]` |
+| `list_on_demand_feature_views` | `(allow_cache: bool = False, tags: Optional[dict] = None)` | `List[OnDemandFeatureView]` |
+| `list_stream_feature_views` | `(allow_cache: bool = False, tags: Optional[dict] = None)` | `List[StreamFeatureView]` |
+| `list_data_sources` | `(allow_cache: bool = False, tags: Optional[dict] = None)` | `List[DataSource]` |
+| `list_permissions` | `(allow_cache: bool = False, tags: Optional[dict] = None)` | `List[Permission]` |
+| `refresh_registry` | `()` | `None` — forces a full registry cache refresh |
+
+</Accordion>

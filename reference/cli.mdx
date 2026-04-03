@@ -1,0 +1,842 @@
+---
+title: "CLI reference"
+description: "Complete reference for all Feast CLI commands, options, and flags."
+---
+
+The Feast CLI is bundled with the Feast Python package and is available immediately after installation.
+
+```text
+Usage: feast [OPTIONS] COMMAND [ARGS]...
+
+  Feast CLI
+
+  For more information, see our public docs at https://docs.feast.dev/
+
+Options:
+  -c, --chdir TEXT           Switch to a different feature repository directory
+                             before executing the given subcommand.
+  --log-level TEXT           Logging level: DEBUG, INFO, WARNING, ERROR, or
+                             CRITICAL (case-insensitive). Default: warning.
+  -f, --feature-store-yaml   Override the path to feature_store.yaml.
+  --help                     Show this message and exit.
+```
+
+## Global options
+
+<ParamField path="-c, --chdir" type="string">
+  Switch to a different feature repository directory before executing the given subcommand. Can also be set via the `FEATURE_REPO_DIR_ENV_VAR` environment variable.
+
+  ```bash
+  feast -c path/to/my/feature/repo apply
+  ```
+</ParamField>
+
+<ParamField path="--log-level" type="string" default="warning">
+  Set the logging verbosity. Accepted values: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (case-insensitive).
+</ParamField>
+
+<ParamField path="-f, --feature-store-yaml" type="string">
+  Override the directory where the CLI should look for the `feature_store.yaml` file. Can also be set via the `FEAST_FS_YAML_FILE_PATH` environment variable.
+</ParamField>
+
+---
+
+## Commands
+
+<AccordionGroup>
+
+  <Accordion title="feast init">
+
+    Creates a new Feast feature repository from a template.
+
+    ```text
+    feast init [PROJECT_DIRECTORY] [OPTIONS]
+    ```
+
+    **Options**
+
+    <ParamField path="PROJECT_DIRECTORY" type="string">
+      Name of the directory to create. If omitted, Feast generates a random project name.
+    </ParamField>
+
+    <ParamField path="-m, --minimal" type="flag">
+      Create an empty project repository with no sample data or feature definitions.
+    </ParamField>
+
+    <ParamField path="-t, --template" type="string" default="local">
+      Specify a template for the created project. Available choices:
+      `local`, `gcp`, `aws`, `snowflake`, `spark`, `postgres`, `hbase`, `cassandra`, `hazelcast`, `couchbase`, `milvus`, `ray`, `ray_rag`, `pytorch_nlp`
+    </ParamField>
+
+    <ParamField path="--repo-path" type="string">
+      Directory path where the repository will be created. By default, a subdirectory with the project name is created in the current working directory.
+    </ParamField>
+
+    **Example**
+
+    ```bash
+    # Create a local project
+    feast init my_feature_repo
+
+    # Create a GCP-configured project
+    feast init -t gcp my_feature_repo
+
+    # Create an empty project
+    feast init -m my_feature_repo
+    ```
+
+    **Generated structure (local template)**
+
+    ```text
+    my_feature_repo/
+    ├── data/
+    │   └── driver_stats.parquet
+    ├── example.py
+    └── feature_store.yaml
+    ```
+
+  </Accordion>
+
+  <Accordion title="feast apply">
+
+    Registers feature definitions from your feature repository to the registry and provisions any required infrastructure.
+
+    ```bash
+    feast apply [OPTIONS]
+    ```
+
+    **Options**
+
+    <ParamField path="--skip-source-validation" type="flag">
+      Skip validation of data sources. Feast will not check whether the referenced tables exist in the offline store.
+    </ParamField>
+
+    <ParamField path="--skip-feature-view-validation" type="flag">
+      Skip validation of feature views. Use with caution — this bypasses important schema checks.
+    </ParamField>
+
+    <ParamField path="--no-progress" type="flag">
+      Disable progress bars during the apply operation.
+    </ParamField>
+
+    <ParamField path="--no-promote" type="flag" default="false">
+      Save new feature view versions without promoting them to active. New versions remain accessible via `@v<N>` reads and `--version` materialization.
+    </ParamField>
+
+    **What `feast apply` does**
+
+    1. Scans all Python files in your feature repository recursively.
+    2. Validates feature definitions (uniqueness, schema correctness, etc.).
+    3. Syncs metadata to the registry. Creates the registry file if it does not exist.
+    4. Provisions infrastructure appropriate for your configured `provider` (e.g., creates a SQLite database for `local`, DynamoDB tables for `aws`).
+
+    <Note>
+      `feast apply` only registers or updates objects found in your Python files. It does **not** delete objects you have removed from your code. Use `feast delete` or the Python SDK to remove objects from the registry.
+    </Note>
+
+    <Warning>
+      When using a cloud provider (`gcp` or `aws`), `feast apply` may create cloud infrastructure and incur costs.
+    </Warning>
+
+    <Tip>
+      The `--skip-feature-view-validation` flag is useful for On-Demand Feature Views with complex transformations that trigger overly strict validation errors. Report any such validation issues to the Feast team.
+    </Tip>
+
+    **Examples**
+
+    ```bash
+    # Standard apply
+    feast apply
+
+    # Skip data source validation only
+    feast apply --skip-source-validation
+
+    # Skip feature view validation only
+    feast apply --skip-feature-view-validation
+
+    # Skip both validations
+    feast apply --skip-source-validation --skip-feature-view-validation
+    ```
+
+  </Accordion>
+
+  <Accordion title="feast plan">
+
+    Preview the changes that `feast apply` would make without executing them.
+
+    ```bash
+    feast plan [OPTIONS]
+    ```
+
+    **Options**
+
+    <ParamField path="--skip-source-validation" type="flag">
+      Skip validation of data sources.
+    </ParamField>
+
+    <ParamField path="--skip-feature-view-validation" type="flag">
+      Skip validation of feature views.
+    </ParamField>
+
+    **Example**
+
+    ```bash
+    feast plan
+    feast plan --skip-source-validation
+    ```
+
+  </Accordion>
+
+  <Accordion title="feast materialize">
+
+    Loads data from the offline store into the online store for a specified time range (non-incremental).
+
+    ```bash
+    feast materialize [START_TS] [END_TS] [OPTIONS]
+    ```
+
+    `START_TS` and `END_TS` must be in ISO 8601 format, e.g. `2021-07-16T19:20:01`.
+
+    **Options**
+
+    <ParamField path="START_TS" type="string">
+      Start of the time window to materialize (ISO 8601). Required unless `--disable-event-timestamp` is set.
+    </ParamField>
+
+    <ParamField path="END_TS" type="string">
+      End of the time window to materialize (ISO 8601). Required unless `--disable-event-timestamp` is set.
+    </ParamField>
+
+    <ParamField path="-v, --views" type="string (repeatable)">
+      One or more feature view names to materialize. If omitted, all registered feature views are materialized.
+    </ParamField>
+
+    <ParamField path="--disable-event-timestamp" type="flag">
+      Materialize all available data without requiring event timestamp columns. Uses the current datetime as the event timestamp. Cannot be combined with `START_TS` / `END_TS`.
+    </ParamField>
+
+    <ParamField path="--version" type="string">
+      Version to materialize (e.g. `v2`). Requires `--views` with exactly one feature view.
+    </ParamField>
+
+    **Examples**
+
+    ```bash
+    # Materialize all feature views between two timestamps
+    feast materialize 2020-01-01T00:00:00 2022-01-01T00:00:00
+
+    # Materialize a specific feature view
+    feast materialize -v driver_hourly_stats 2020-01-01T00:00:00 2022-01-01T00:00:00
+
+    # Materialize when source data has no event timestamps
+    feast materialize --disable-event-timestamp
+
+    # Materialize a specific version of a feature view
+    feast materialize -v driver_hourly_stats --version v2 2020-01-01T00:00:00 2022-01-01T00:00:00
+    ```
+
+    **Sample output**
+
+    ```text
+    Materializing 1 feature views from 2020-01-01 to 2022-01-01
+
+    driver_hourly_stats:
+    100%|██████████████████████████| 5/5 [00:00<00:00, 5949.37it/s]
+    ```
+
+  </Accordion>
+
+  <Accordion title="feast materialize-incremental">
+
+    Loads data from the offline store into the online store incrementally, starting from the last materialization point.
+
+    ```bash
+    feast materialize-incremental END_TS [OPTIONS]
+    ```
+
+    Feast reads from the previously recorded end timestamp (from the last `materialize` or `materialize-incremental` run) up to `END_TS`. If no prior materialization exists, it reads from the beginning of time.
+
+    **Options**
+
+    <ParamField path="END_TS" type="string" required>
+      End of the time window in ISO 8601 format, e.g. `2022-01-01T00:00:00`.
+    </ParamField>
+
+    <ParamField path="-v, --views" type="string (repeatable)">
+      One or more feature view names. If omitted, all registered feature views are materialized.
+    </ParamField>
+
+    <ParamField path="--version" type="string">
+      Version to materialize (e.g. `v2`). Requires `--views` with exactly one feature view.
+    </ParamField>
+
+    **Examples**
+
+    ```bash
+    # Incremental materialize up to a given timestamp
+    feast materialize-incremental 2022-01-01T00:00:00
+
+    # Incremental materialize for a specific feature view
+    feast materialize-incremental -v driver_hourly_stats 2022-01-01T00:00:00
+    ```
+
+  </Accordion>
+
+  <Accordion title="feast serve">
+
+    Starts a local feature server that serves online features over HTTP or gRPC.
+
+    ```bash
+    feast serve [OPTIONS]
+    ```
+
+    **Options**
+
+    <ParamField path="-h, --host" type="string" default="127.0.0.1">
+      Host address to bind the server to.
+    </ParamField>
+
+    <ParamField path="-p, --port" type="integer" default="6566">
+      Port to listen on.
+    </ParamField>
+
+    <ParamField path="-t, --type" type="string" default="http">
+      Server protocol. Accepted values: `http`, `grpc`.
+    </ParamField>
+
+    <ParamField path="--no-access-log" type="flag">
+      Disable the Uvicorn access log.
+    </ParamField>
+
+    <ParamField path="-w, --workers" type="integer" default="1">
+      Number of worker processes. Pass `-1` to auto-calculate based on available CPU cores (`(cpu_count * 2) + 1`).
+    </ParamField>
+
+    <ParamField path="--worker-connections" type="integer" default="1000">
+      Maximum number of simultaneous clients per worker process.
+    </ParamField>
+
+    <ParamField path="--max-requests" type="integer" default="1000">
+      Maximum requests a worker will handle before restarting. Helps prevent memory leaks.
+    </ParamField>
+
+    <ParamField path="--max-requests-jitter" type="integer" default="50">
+      Random jitter added to `--max-requests` to prevent all workers from restarting simultaneously.
+    </ParamField>
+
+    <ParamField path="--keep-alive-timeout" type="integer" default="30">
+      Timeout in seconds for keep-alive connections.
+    </ParamField>
+
+    <ParamField path="-r, --registry_ttl_sec" type="integer" default="60">
+      Number of seconds after which the registry cache is refreshed. Higher values reduce refresh overhead but increase staleness.
+    </ParamField>
+
+    <ParamField path="-k, --key" type="string">
+      Path to the TLS certificate private key. Must be paired with `--cert` to enable TLS mode.
+    </ParamField>
+
+    <ParamField path="-c, --cert" type="string">
+      Path to the TLS certificate public key. Must be paired with `--key` to enable TLS mode.
+    </ParamField>
+
+    <ParamField path="-m, --metrics" type="flag">
+      Enable the Prometheus metrics server.
+    </ParamField>
+
+    **Examples**
+
+    ```bash
+    # Start with defaults
+    feast serve
+
+    # Bind to all interfaces on port 8080
+    feast serve --host 0.0.0.0 --port 8080
+
+    # Start with 4 worker processes
+    feast serve --workers 4
+
+    # Start with TLS enabled
+    feast serve --key server.key --cert server.crt
+
+    # Start gRPC server
+    feast serve --type grpc
+    ```
+
+  </Accordion>
+
+  <Accordion title="feast serve_offline">
+
+    Starts a remote offline feature server locally.
+
+    ```bash
+    feast serve_offline [OPTIONS]
+    ```
+
+    <ParamField path="-h, --host" type="string" default="127.0.0.1">
+      Host address to bind the server to.
+    </ParamField>
+
+    <ParamField path="-p, --port" type="integer" default="8815">
+      Port to listen on.
+    </ParamField>
+
+    <ParamField path="-k, --key" type="string">
+      Path to the TLS certificate private key.
+    </ParamField>
+
+    <ParamField path="-c, --cert" type="string">
+      Path to the TLS certificate public key.
+    </ParamField>
+
+    **Example**
+
+    ```bash
+    feast serve_offline --host 0.0.0.0 --port 8815
+    ```
+
+  </Accordion>
+
+  <Accordion title="feast serve_registry">
+
+    Starts a Feast Registry server. Supports gRPC (default) and/or REST.
+
+    ```bash
+    feast serve_registry [OPTIONS]
+    ```
+
+    <ParamField path="-p, --port" type="integer" default="6570">
+      Port for the gRPC registry server.
+    </ParamField>
+
+    <ParamField path="--rest-port" type="integer" default="6571">
+      Port for the REST API registry server (when `--rest-api` is enabled).
+    </ParamField>
+
+    <ParamField path="--grpc / --no-grpc" type="flag" default="true">
+      Enable or disable the gRPC registry server.
+    </ParamField>
+
+    <ParamField path="-r, --rest-api" type="flag" default="false">
+      Enable the REST API registry server.
+    </ParamField>
+
+    <ParamField path="-k, --key" type="string">
+      Path to the TLS certificate private key.
+    </ParamField>
+
+    <ParamField path="-c, --cert" type="string">
+      Path to the TLS certificate public key.
+    </ParamField>
+
+    **Examples**
+
+    ```bash
+    # Start gRPC registry server (default)
+    feast serve_registry
+
+    # Start both gRPC and REST registry servers
+    feast serve_registry --rest-api
+
+    # Start REST only
+    feast serve_registry --no-grpc --rest-api
+    ```
+
+  </Accordion>
+
+  <Accordion title="feast ui">
+
+    Starts the Feast web UI.
+
+    ```bash
+    feast ui [OPTIONS]
+    ```
+
+    **Options**
+
+    <ParamField path="-h, --host" type="string" default="0.0.0.0">
+      Host address to bind the UI server to.
+    </ParamField>
+
+    <ParamField path="-p, --port" type="integer" default="8888">
+      Port to listen on.
+    </ParamField>
+
+    <ParamField path="-r, --registry_ttl_sec" type="integer" default="5">
+      Number of seconds after which the registry is refreshed.
+    </ParamField>
+
+    <ParamField path="--root_path" type="string">
+      Root path for running the UI behind a reverse proxy.
+    </ParamField>
+
+    <ParamField path="-k, --key" type="string">
+      Path to the TLS certificate private key.
+    </ParamField>
+
+    <ParamField path="-c, --cert" type="string">
+      Path to the TLS certificate public key.
+    </ParamField>
+
+    **Example**
+
+    ```bash
+    feast ui
+    feast ui --port 8080 --registry_ttl_sec 30
+    ```
+
+  </Accordion>
+
+  <Accordion title="feast entities">
+
+    Subcommands for accessing entities registered in the feature store.
+
+    **List entities**
+
+    ```bash
+    feast entities list [OPTIONS]
+    ```
+
+    <ParamField path="--tags" type="string (repeatable)">
+      Filter by tags, e.g. `--tags 'team:ml'`. Returns entities where **all** specified tags match.
+    </ParamField>
+
+    ```bash
+    feast entities list
+    feast entities list --tags 'team:ml'
+    ```
+
+    **Sample output**
+
+    ```text
+    NAME       DESCRIPTION    TYPE
+    driver_id  driver id      ValueType.INT64
+    ```
+
+    ---
+
+    **Describe an entity**
+
+    ```bash
+    feast entities describe NAME
+    ```
+
+    ```bash
+    feast entities describe driver_id
+    ```
+
+    **Sample output**
+
+    ```yaml
+    name: driver_id
+    valueType: INT64
+    description: driver id
+    joinKey: driver_id
+    tags: {}
+    ```
+
+  </Accordion>
+
+  <Accordion title="feast feature-views">
+
+    Subcommands for accessing feature views registered in the feature store.
+
+    **List feature views**
+
+    ```bash
+    feast feature-views list [OPTIONS]
+    ```
+
+    <ParamField path="--tags" type="string (repeatable)">
+      Filter by tags. Returns feature views where **all** specified tags match.
+    </ParamField>
+
+    ```bash
+    feast feature-views list
+    feast feature-views list --tags 'team:ml'
+    ```
+
+    **Sample output**
+
+    ```text
+    NAME                 ENTITIES    TYPE
+    driver_hourly_stats  {'driver'}  FeatureView
+    ```
+
+    ---
+
+    **Describe a feature view**
+
+    ```bash
+    feast feature-views describe NAME
+    ```
+
+    ```bash
+    feast feature-views describe driver_hourly_stats
+    ```
+
+    ---
+
+    **List version history**
+
+    ```bash
+    feast feature-views list-versions FEATURE_VIEW_NAME
+    ```
+
+    ```bash
+    feast feature-views list-versions driver_hourly_stats
+    ```
+
+    **Sample output**
+
+    ```text
+    VERSION  TYPE          CREATED              VERSION_ID
+    v0       feature_view  2024-01-15 10:30:00  a1b2c3d4-...
+    v1       feature_view  2024-01-16 14:22:00  e5f6g7h8-...
+    ```
+
+  </Accordion>
+
+  <Accordion title="feast permissions">
+
+    Subcommands for managing and inspecting permissions in the feature store.
+
+    **List permissions**
+
+    ```bash
+    feast permissions list [OPTIONS]
+    ```
+
+    <ParamField path="-v, --verbose" type="flag">
+      Print the resources matching each configured permission in a tree view.
+    </ParamField>
+
+    <ParamField path="--tags" type="string (repeatable)">
+      Filter by tags. Returns permissions where **all** specified tags match.
+    </ParamField>
+
+    ```bash
+    feast permissions list
+    feast permissions list -v
+    ```
+
+    ---
+
+    **Describe a permission**
+
+    ```bash
+    feast permissions describe NAME
+    ```
+
+    ```bash
+    feast permissions describe reader_permission
+    ```
+
+    **Sample output**
+
+    ```yaml
+    name: reader_permission
+    types:
+    - FEATURE_VIEW
+    namePattern: driver_hourly_stats
+    actions:
+    - DESCRIBE
+    policy:
+      roleBasedPolicy:
+        roles:
+        - reader
+    ```
+
+    ---
+
+    **Check for unsecured resources**
+
+    ```bash
+    feast permissions check
+    ```
+
+    Identifies resources and actions not covered by any permission configuration. Useful when roles or permissions have been recently changed.
+
+    **Sample output**
+
+    ```text
+    The following resources are not secured by any permission configuration:
+    NAME                         TYPE
+    driver                       Entity
+
+    The following actions are not secured by any permission configuration:
+    NAME      TYPE    UNSECURED ACTIONS
+    driver    Entity  CREATE, DESCRIBE, UPDATE, DELETE, READ_ONLINE, READ_OFFLINE, WRITE_ONLINE, WRITE_OFFLINE
+    ```
+
+    ---
+
+    **List configured roles**
+
+    ```bash
+    feast permissions list-roles [OPTIONS]
+    ```
+
+    <ParamField path="-v, --verbose" type="flag">
+      Print the resources and actions permitted to each role.
+    </ParamField>
+
+    ```bash
+    feast permissions list-roles
+    feast permissions list-roles -v
+    ```
+
+    **Sample output**
+
+    ```text
+    ROLE NAME
+    admin
+    reader
+    writer
+    ```
+
+  </Accordion>
+
+  <Accordion title="feast delete">
+
+    Deletes a Feast object from the registry by name.
+
+    ```bash
+    feast delete OBJECT_NAME
+    ```
+
+    Feast searches across all object types (entities, feature views, feature services, data sources, saved datasets, validation references, stream feature views, on-demand feature views) and deletes the first match found.
+
+    <Warning>
+      Deletion is permanent. The object is removed from the registry and any associated infrastructure is torn down.
+    </Warning>
+
+    <Info>
+      If multiple objects share the same name across different types, `feast delete` will delete the first one found. For more precise control, use the Python SDK (`store.delete_feature_view()`, `store.delete_feature_service()`, etc.).
+    </Info>
+
+    **Examples**
+
+    ```bash
+    # Delete a feature view
+    feast delete driver_hourly_stats
+
+    # Delete an entity
+    feast delete driver
+    ```
+
+  </Accordion>
+
+  <Accordion title="feast teardown">
+
+    Tears down all deployed feature store infrastructure for the current project.
+
+    ```bash
+    feast teardown
+    ```
+
+    <Warning>
+      This is a destructive operation. All online store tables and other provisioned infrastructure will be removed.
+    </Warning>
+
+    **Example**
+
+    ```bash
+    feast teardown
+    ```
+
+  </Accordion>
+
+  <Accordion title="feast registry-dump">
+
+    Prints the full contents of the metadata registry to stdout in a human-readable format.
+
+    ```bash
+    feast registry-dump
+    ```
+
+    **Example**
+
+    ```bash
+    feast registry-dump
+    feast registry-dump > registry_backup.txt
+    ```
+
+  </Accordion>
+
+  <Accordion title="feast configuration">
+
+    Displays the resolved configuration Feast is using, including all defaults applied by Feast.
+
+    ```bash
+    feast configuration
+    ```
+
+    **Sample output**
+
+    ```yaml
+    project: my_project
+    registry: data/registry.db
+    provider: local
+    online_store:
+      type: sqlite
+      path: data/online_store.db
+    offline_store:
+      type: dask
+    entity_key_serialization_version: 3
+    auth:
+      type: no_auth
+    ```
+
+  </Accordion>
+
+  <Accordion title="feast version">
+
+    Displays the installed Feast SDK version.
+
+    ```bash
+    feast version
+    ```
+
+    **Example output**
+
+    ```text
+    Feast SDK Version: "0.40.0"
+    ```
+
+  </Accordion>
+
+  <Accordion title="feast validate">
+
+    Validates logged features from a feature service against a validation reference.
+
+    ```bash
+    feast validate [OPTIONS] START_TS END_TS
+    ```
+
+    `START_TS` and `END_TS` must be in ISO 8601 format, e.g. `2021-07-16T19:20:01`.
+
+    <ParamField path="-f, --feature-service" type="string">
+      Name of the feature service to validate.
+    </ParamField>
+
+    <ParamField path="-r, --reference" type="string">
+      Name of the validation reference to compare against.
+    </ParamField>
+
+    <ParamField path="--no-profile-cache" type="flag">
+      Do not store the cached statistical profile in the registry.
+    </ParamField>
+
+    **Example**
+
+    ```bash
+    feast validate \
+      --feature-service driver_ranking_service \
+      --reference driver_stats_reference \
+      2021-01-01T00:00:00 2021-12-31T23:59:59
+    ```
+
+  </Accordion>
+
+</AccordionGroup>

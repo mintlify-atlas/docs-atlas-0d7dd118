@@ -1,0 +1,360 @@
+---
+title: "Feature transformation"
+description: "Transform features at retrieval time or write time using on-demand feature views with pandas or native Python."
+---
+
+On-demand feature views (ODFVs) let you apply transformation logic to features during retrieval — without pre-computing and storing every derived value. They are useful when a transformation depends on request-time data, or when you want to iterate on feature engineering without a full offline pipeline.
+
+<Warning>
+  On-demand feature views are a beta feature. The API is stable but there may be rough edges. Contributions are welcome.
+</Warning>
+
+---
+
+## When to use on-demand vs pre-computed features
+
+<CardGroup cols={2}>
+  <Card title="On-demand transformation" icon="bolt">
+    Use when the transformation depends on **request-time data** (e.g. a user's current location), when you want to iterate quickly without a batch pipeline, or when the computation is lightweight enough to run at serving time.
+  </Card>
+  <Card title="Pre-computed (materialized) features" icon="database">
+    Use when the transformation is expensive, when the result is the same for all requests for a given entity, or when you want to guarantee identical values in training and serving.
+  </Card>
+</CardGroup>
+
+---
+
+## The `@on_demand_feature_view` decorator
+
+Register an ODFV by decorating a Python function with `@on_demand_feature_view`. The decorator accepts:
+
+| Parameter | Description |
+|---|---|
+| `sources` | List of `FeatureView` and/or `RequestSource` objects that supply input columns |
+| `schema` | List of `Field` objects describing the output features |
+| `mode` | `"pandas"` (default) or `"python"` — controls the input/output format |
+| `write_to_online_store` | If `True`, apply the transformation during ingestion and store the result; defaults to `False` (transform at read time) |
+| `singleton` | (python mode only) If `True`, the function receives a single-row dict instead of lists |
+
+---
+
+## Input sources
+
+### `RequestSource` — request-time data
+
+`RequestSource` lets you pass values that are only available at request time (e.g. from the incoming API payload) directly into a transformation:
+
+```python request_source.py
+from feast import Field, RequestSource
+from feast.types import Int64
+
+# Values passed by the caller at request time
+input_request = RequestSource(
+    name="vals_to_add",
+    schema=[
+        Field(name="val_to_add", dtype=Int64),
+        Field(name="val_to_add_2", dtype=Int64),
+    ],
+)
+```
+
+### `FeatureView` outputs
+
+You can also pass the output columns of an existing `FeatureView` directly as a source. Feast automatically fetches those features and makes them available to the transformation function.
+
+---
+
+## Transformation modes
+
+### Pandas mode
+
+The transformation function receives a `pd.DataFrame` containing one row per entity and one column per input feature. It must return a `pd.DataFrame` with the output features.
+
+```python pandas_mode.py
+from feast import Field, RequestSource
+from feast.on_demand_feature_view import on_demand_feature_view
+from feast.types import Float64, Int64
+import pandas as pd
+
+input_request = RequestSource(
+    name="vals_to_add",
+    schema=[
+        Field(name="val_to_add", dtype=Int64),
+        Field(name="val_to_add_2", dtype=Int64),
+    ],
+)
+
+@on_demand_feature_view(
+    sources=[driver_hourly_stats_view, input_request],
+    schema=[
+        Field(name="conv_rate_plus_val1", dtype=Float64),
+        Field(name="conv_rate_plus_val2", dtype=Float64),
+    ],
+    mode="pandas",
+)
+def transformed_conv_rate(features_df: pd.DataFrame) -> pd.DataFrame:
+    df = pd.DataFrame()
+    df["conv_rate_plus_val1"] = features_df["conv_rate"] + features_df["val_to_add"]
+    df["conv_rate_plus_val2"] = features_df["conv_rate"] + features_df["val_to_add_2"]
+    return df
+```
+
+### Native Python mode — list inputs
+
+The transformation function receives a `Dict[str, List[Any]]` where each key is a feature name and the value is a list of feature values (one per entity). It must return a `Dict[str, List[Any]]`.
+
+```python python_mode_list.py
+from feast import Field
+from feast.on_demand_feature_view import on_demand_feature_view
+from feast.types import Float64
+from typing import Any, Dict
+
+@on_demand_feature_view(
+    sources=[driver_hourly_stats_view, input_request],
+    schema=[
+        Field(name="conv_rate_plus_val1_python", dtype=Float64),
+        Field(name="conv_rate_plus_val2_python", dtype=Float64),
+    ],
+    mode="python",
+)
+def transformed_conv_rate_python(inputs: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "conv_rate_plus_val1_python": [
+            conv_rate + val_to_add
+            for conv_rate, val_to_add in zip(inputs["conv_rate"], inputs["val_to_add"])
+        ],
+        "conv_rate_plus_val2_python": [
+            conv_rate + val_to_add
+            for conv_rate, val_to_add in zip(inputs["conv_rate"], inputs["val_to_add_2"])
+        ],
+    }
+```
+
+### Native Python mode — singleton inputs
+
+Set `singleton=True` to receive a single-row `dict` instead of lists. This is more intuitive for transformations that operate on one entity at a time:
+
+```python python_mode_singleton.py
+from feast import Field
+from feast.on_demand_feature_view import on_demand_feature_view
+from feast.types import Float64
+from typing import Any, Dict
+
+@on_demand_feature_view(
+    sources=[driver_hourly_stats_view, input_request],
+    schema=[
+        Field(name="conv_rate_plus_acc_singleton", dtype=Float64),
+    ],
+    mode="python",
+    singleton=True,
+)
+def transformed_conv_rate_singleton(inputs: Dict[str, Any]) -> Dict[str, Any]:
+    # inputs is a single dict, not a list
+    return {
+        "conv_rate_plus_acc_singleton": inputs["conv_rate"] + inputs["acc_rate"]
+    }
+```
+
+---
+
+## Transformations at write time
+
+By default, transformations run at read time. Set `write_to_online_store=True` to apply the transformation during ingestion instead and store the result in the online store. This reduces computation during serving at the cost of storing more data.
+
+```python write_time_transform.py
+from feast import Field
+from feast.on_demand_feature_view import on_demand_feature_view
+from feast.types import Float64
+import pandas as pd
+
+@on_demand_feature_view(
+    sources=[driver_hourly_stats_view],
+    schema=[
+        Field(name="conv_rate_adjusted", dtype=Float64),
+    ],
+    mode="pandas",
+    write_to_online_store=True,  # compute and store at ingestion time
+)
+def transformed_conv_rate(features_df: pd.DataFrame) -> pd.DataFrame:
+    df = pd.DataFrame()
+    df["conv_rate_adjusted"] = features_df["conv_rate"] * 1.1
+    return df
+```
+
+Push data including all input columns to trigger the transformation:
+
+```python push_for_write_time.py
+from feast import FeatureStore
+import pandas as pd
+
+store = FeatureStore(repo_path=".")
+
+data = pd.DataFrame({
+    "driver_id": [1001],
+    "event_timestamp": [pd.Timestamp.now(tz="UTC")],
+    "conv_rate": [0.5],
+    "acc_rate": [0.8],
+    "avg_daily_trips": [10],
+})
+
+store.push("driver_hourly_stats_push_source", data)
+```
+
+---
+
+## Aggregations
+
+ODFVs support aggregating multiple rows before applying a transformation. Aggregations and transformation functions are mutually exclusive — when you specify aggregations, the function body is not used.
+
+```python aggregations.py
+from feast import Aggregation, Field
+from feast.on_demand_feature_view import on_demand_feature_view
+from feast.types import Float64, Int64
+from datetime import timedelta
+
+@on_demand_feature_view(
+    sources=[driver_hourly_stats_view],
+    schema=[
+        Field(name="total_trips", dtype=Int64),
+        Field(name="avg_rating", dtype=Float64),
+    ],
+    aggregations=[
+        Aggregation(column="trips", function="sum"),
+        Aggregation(column="rating", function="mean"),
+    ],
+)
+def driver_aggregated_stats(inputs):
+    pass  # body is unused when aggregations are specified
+```
+
+Aggregated columns are named `{function}_{column}` — for example, `sum_trips` and `mean_rating`.
+
+---
+
+## Feature retrieval with ODFVs
+
+<Steps>
+  <Step title="Apply the ODFV">
+    ```bash
+    feast apply
+    ```
+
+    Feast validates the ODFV by constructing random inputs and running the transformation function. If your transformation uses complex logic that fails this check, you can skip validation:
+
+    ```bash
+    feast apply --skip-feature-view-validation
+    ```
+  </Step>
+
+  <Step title="Retrieve historical features (training data)">
+    Reference ODFV features alongside regular feature view features using `view_name:feature_name` syntax:
+
+    ```python historical.py
+    training_df = store.get_historical_features(
+        entity_df=entity_df,
+        features=[
+            "driver_hourly_stats:conv_rate",
+            "driver_hourly_stats:acc_rate",
+            "transformed_conv_rate:conv_rate_plus_val1",
+            "transformed_conv_rate:conv_rate_plus_val2",
+            "transformed_conv_rate_singleton:conv_rate_plus_acc_singleton",
+        ],
+    ).to_df()
+    ```
+  </Step>
+
+  <Step title="Retrieve online features (serving)">
+    Pass request-time values in `entity_rows` alongside entity keys:
+
+    ```python online.py
+    entity_rows = [
+        {
+            "driver_id": 1001,
+            "val_to_add": 1,
+            "val_to_add_2": 2,
+        }
+    ]
+
+    online_response = store.get_online_features(
+        entity_rows=entity_rows,
+        features=[
+            "driver_hourly_stats:conv_rate",
+            "driver_hourly_stats:acc_rate",
+            "transformed_conv_rate_python:conv_rate_plus_val1_python",
+            "transformed_conv_rate_python:conv_rate_plus_val2_python",
+            "transformed_conv_rate_singleton:conv_rate_plus_acc_singleton",
+        ],
+    ).to_dict()
+    ```
+
+    <Note>
+      The name of the ODFV is the decorated function name (e.g. `transformed_conv_rate`), not the variable name.
+    </Note>
+  </Step>
+</Steps>
+
+---
+
+## Materializing pre-transformed data
+
+If you have already applied transformations in a batch pipeline (e.g. with Spark), you can write the pre-computed values to the online store directly, skipping the ODFV transformation:
+
+```python skip_transform.py
+from feast import FeatureStore
+import pandas as pd
+
+store = FeatureStore(repo_path=".")
+
+pre_transformed_data = pd.DataFrame({
+    "driver_id": [1001],
+    "event_timestamp": [pd.Timestamp.now(tz="UTC")],
+    "conv_rate": [0.5],
+    "conv_rate_adjusted": [0.55],  # already computed upstream
+})
+
+store.write_to_online_store(
+    feature_view_name="transformed_conv_rate",
+    df=pre_transformed_data,
+    transform_on_write=False,
+)
+```
+
+Even with pre-materialized values, the feature server can still apply transformations at API call time for any features that require real-time computation.
+
+---
+
+## CLI commands
+
+```bash
+# List all registered on-demand feature views
+feast on-demand-feature-views list
+
+# Describe a specific on-demand feature view
+feast on-demand-feature-views describe transformed_conv_rate
+```
+
+---
+
+## Troubleshooting
+
+<Accordion title="feast apply fails with a validation error on my ODFV">
+  Feast validates ODFVs by generating random inputs and running the transformation. Complex logic (e.g. conditional branches, external lookups) can cause false failures.
+
+  Skip validation when you have confirmed the transformation is correct on real data:
+
+  **CLI:**
+  ```bash
+  feast apply --skip-feature-view-validation
+  ```
+
+  **Python SDK:**
+  ```python
+  store.apply([my_odfv], skip_feature_view_validation=True)
+  ```
+
+  Report persistent false-positive validation failures at [github.com/feast-dev/feast/issues](https://github.com/feast-dev/feast/issues).
+</Accordion>
+
+<Accordion title="My request-time features are not passed to the transformation">
+  Make sure you include `RequestSource` fields directly in the `entity_rows` dict when calling `get_online_features`. Feast passes those values through to the transformation at retrieval time.
+</Accordion>

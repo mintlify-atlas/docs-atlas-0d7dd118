@@ -1,0 +1,294 @@
+---
+title: "Go feature server"
+description: "A high-performance alternative to the Python feature server. Written in Go, supports HTTP and gRPC interfaces, OTEL tracing, and Prometheus metrics."
+---
+
+<Note>
+  The Go feature server is currently in **Alpha**. The API and configuration options may change between releases.
+</Note>
+
+The Go feature server is a high-performance HTTP and gRPC server for online feature retrieval. It is written in Go and designed as a drop-in replacement for the Python feature server in latency-sensitive production workloads.
+
+## When to use Go vs Python
+
+| Consideration | Go server | Python server |
+|---|---|---|
+| Throughput and latency | Higher — no GIL, lower per-request overhead | Lower — suitable for moderate traffic |
+| Language of existing stack | Go or any gRPC-compatible client | Any HTTP client |
+| On-demand feature views (Python transforms) | Requires a separate Python transformation service | Native support |
+| Prometheus metrics | Native on a dedicated port | Opt-in, port `8000` |
+| OTEL tracing | Supported via `ENABLE_OTEL_TRACING` | Not available |
+| Feature logging to offline store | Not yet implemented | Supported |
+| TLS/SSL | Not yet available in the standalone binary | Supported via `--key`/`--cert` |
+
+Choose the Go server when your priority is low-latency online retrieval at scale. Use the Python server when you need on-demand Python transforms, TLS, or feature logging without additional services.
+
+---
+
+## Building the Go feature server
+
+The Go feature server is compiled from the `go/` directory of the Feast repository.
+
+<Steps>
+  <Step title="Clone the Feast repository">
+    ```bash
+    git clone https://github.com/feast-dev/feast.git
+    cd feast
+    ```
+  </Step>
+  <Step title="Build the binary">
+    ```bash
+    go build -o feast-go ./go/main.go
+    ```
+  </Step>
+  <Step title="Start the HTTP server">
+    ```bash
+    # HTTP server on port 8080, Prometheus metrics on port 9090
+    ./feast-go --type=http --port=8080 --metrics-port=9090
+    ```
+
+    Or start a gRPC server instead:
+
+    ```bash
+    ./feast-go --type=grpc --port=8080 --metrics-port=9091
+    ```
+  </Step>
+</Steps>
+
+### CLI flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--type` | `http` | Server mode: `http` or `grpc` |
+| `--host` | (all interfaces) | Bind address |
+| `--port` | `8080` | Listening port |
+| `--metrics-port` | `9090` | Prometheus metrics port |
+| `--chdir` | Current directory | Path to the directory containing `feature_store.yaml` |
+
+---
+
+## Configuration
+
+### feature_store.yaml
+
+The Go feature server reads the same `feature_store.yaml` as the Python SDK. No additional top-level keys are required for basic operation.
+
+If your feature views use **on-demand Python transforms**, you must run a Python-based transformation service alongside the Go server and configure its endpoint:
+
+```yaml
+# feature_store.yaml
+project: my_project
+provider: local
+registry: data/registry.db
+online_store:
+  type: redis
+  connection_string: "localhost:6379"
+
+entity_key_serialization_version: 3
+
+feature_server:
+  type: local
+  transformation_service_endpoint: "localhost:6569"
+```
+
+<Note>
+  `transformation_service_endpoint` is only required when you have on-demand feature views with Python transformations. If your feature views have no Python transforms, omit this field.
+</Note>
+
+### Starting the Python transformation service
+
+When on-demand feature views are present, start the transformation service before the Go server:
+
+```python
+# serve_transformations.py
+from feast.feature_store import FeatureStore
+
+store = FeatureStore(repo_path="./feature_repo/")
+# Default port is 6569
+store.serve_transformations(6569)
+```
+
+```bash
+python serve_transformations.py &
+./feast-go --type=http --port=8080
+```
+
+---
+
+## Supported API endpoints
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/health` | Server health check |
+| `POST` | `/get-online-features` | Retrieve features for one or more entities |
+
+<Warning>
+  The Go server currently supports online feature retrieval only. Push (`/push`), materialization (`/materialize`), and offline write endpoints are not available. Use the Python feature server for those operations.
+</Warning>
+
+### `GET /health`
+
+Returns `200 OK` when the server is ready to serve requests.
+
+```bash
+curl http://localhost:8080/health
+```
+
+### `POST /get-online-features`
+
+The request and response format is identical to the Python feature server.
+
+<CodeGroup>
+
+```bash curl
+curl -X POST "http://localhost:8080/get-online-features" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "features": [
+      "driver_hourly_stats:conv_rate",
+      "driver_hourly_stats:acc_rate",
+      "driver_hourly_stats:avg_daily_trips"
+    ],
+    "entities": {
+      "driver_id": [1001, 1002]
+    }
+  }' | jq
+```
+
+</CodeGroup>
+
+**Response:**
+
+```json
+{
+  "metadata": {
+    "feature_names": [
+      "driver_id",
+      "conv_rate",
+      "acc_rate",
+      "avg_daily_trips"
+    ]
+  },
+  "results": [
+    {
+      "values": [1001, 0.7037263512611389, 0.8724706768989563, 308],
+      "statuses": ["PRESENT", "PRESENT", "PRESENT", "PRESENT"],
+      "event_timestamps": [
+        "1970-01-01T00:00:00Z",
+        "2021-12-31T23:00:00Z",
+        "2021-12-31T23:00:00Z",
+        "2021-12-31T23:00:00Z"
+      ]
+    },
+    {
+      "values": [1002, 0.038169607520103455, 0.48534533381462097, 332],
+      "statuses": ["PRESENT", "PRESENT", "PRESENT", "PRESENT"],
+      "event_timestamps": [
+        "1970-01-01T00:00:00Z",
+        "2021-12-31T23:00:00Z",
+        "2021-12-31T23:00:00Z",
+        "2021-12-31T23:00:00Z"
+      ]
+    }
+  ]
+}
+```
+
+---
+
+## Prometheus metrics
+
+The Go server exposes Prometheus-compatible metrics on a dedicated port (default `9090`).
+
+```bash
+# Scrape metrics
+curl http://localhost:9090/metrics
+```
+
+Key metrics:
+
+| Metric | Type | Description |
+|---|---|---|
+| `http_request_duration_seconds` | Histogram | Response latency per endpoint |
+| `http_requests_total` | Counter | Total requests by status, method, and path |
+| Standard Go process metrics | — | Memory, GC, goroutine counts |
+
+### Prometheus scrape config
+
+```yaml
+scrape_configs:
+  - job_name: feast-go
+    static_configs:
+      - targets: ["localhost:9090"]
+```
+
+---
+
+## Observability with OpenTelemetry
+
+The Go server supports distributed tracing via [OpenTelemetry](https://opentelemetry.io/) (tracing only). Enable it with the `ENABLE_OTEL_TRACING` environment variable:
+
+```bash
+export ENABLE_OTEL_TRACING="true"
+./feast-go --type=http --port=8080
+```
+
+Additional environment variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `ENABLE_OTEL_TRACING` | `"false"` | Set to `"true"` to enable OTEL tracing |
+| `OTEL_SERVICE_NAME` | `"FeastGoFeatureServer"` | Service name reported to the collector |
+
+The default OTLP exporter endpoint is `http://localhost:4318` (HTTP transport). Configure a different endpoint using the [standard OTEL SDK environment variables](https://opentelemetry.io/docs/languages/sdk-configuration/otlp-exporter/).
+
+### Example monitoring stack
+
+The following Docker Compose setup runs Prometheus, Jaeger, and an OTEL Collector alongside the Go server:
+
+```yaml
+services:
+  prometheus:
+    image: prom/prometheus
+    volumes:
+      - ./prometheus.yaml:/etc/prometheus/prometheus.yaml
+    ports:
+      - "9090:9090"
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"
+      - "14268:14268"
+      - "14250:14250"
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml
+    ports:
+      - "8888:8888"
+      - "8889:8889"
+      - "4318:4318"
+    depends_on:
+      - jaeger
+      - prometheus
+```
+
+---
+
+## Limitations
+
+The following capabilities are **not yet available** in the Go feature server:
+
+- **TLS/SSL** — Use a reverse proxy (nginx, Envoy) for TLS termination, or use the Python feature server.
+- **Push endpoints** (`/push`, `/write-to-online-store`) — Use the Python feature server or the Python SDK directly.
+- **Materialization endpoints** (`/materialize`, `/materialize-incremental`) — Use the Python feature server or `feast materialize` CLI.
+- **Feature logging to offline store** — The offline store sink callback is not yet implemented in Go.
+- **Authentication and authorization** — RBAC and token-based auth are not yet supported.
+
+---
+
+## References
+
+- [Expedia Group's Go feature server in production](https://github.com/ExpediaGroup/feast)
+- [Go feature server demo with local tutorial](https://github.com/feast-dev/feast-credit-score-local-tutorial)
+- [OTEL exporter SDK configuration](https://opentelemetry.io/docs/languages/sdk-configuration/otlp-exporter/)

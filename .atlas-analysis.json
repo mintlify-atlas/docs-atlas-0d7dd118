@@ -1,24 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "Feast",
+  "projectType": "sdk-library",
+  "projectName": "Feast",
+  "projectDescription": "An open source feature store for AI/ML that manages offline and online feature infrastructure for model training and real-time inference.",
   "theme": "luma",
-  "colors": {
-    "primary": "#0c6ce3",
-    "light": "#82bfe2",
-    "dark": "#040404"
-  },
-  "favicon": "https://media.brand.dev/e4456cf5-86e2-4cc9-893c-45484f8d1f25.jpg",
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/feast-dev/feast"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/feast-dev/feast"
-    }
-  },
+  "primaryColor": "#0c6ce3",
+  "lightColor": "#82bfe2",
+  "darkColor": "#040404",
   "navigation": {
     "tabs": [
       {
@@ -100,5 +87,36 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "Point-in-time correct feature retrieval for training data generation",
+    "Materialization of batch features into low-latency online stores",
+    "Streaming feature ingestion via Push API and Kafka/Kinesis",
+    "Vector database integration for RAG and GenAI applications",
+    "Multi-cloud support (AWS, GCP, Azure, Snowflake)",
+    "On-demand feature transformations",
+    "Web UI for feature discovery and exploration",
+    "Go and Python feature servers for high-performance serving",
+    "Role-based access control and permissions",
+    "Data quality monitoring integration"
+  ],
+  "publicApiSurface": [
+    "FeatureStore.get_historical_features()",
+    "FeatureStore.get_online_features()",
+    "FeatureStore.push()",
+    "FeatureStore.materialize()",
+    "FeatureStore.materialize_incremental()",
+    "FeatureStore.retrieve_online_documents_v2()",
+    "FeatureStore.apply()",
+    "FeatureView",
+    "OnDemandFeatureView",
+    "StreamFeatureView",
+    "BatchFeatureView",
+    "Entity",
+    "FeatureService",
+    "FileSource / BigQuerySource / SnowflakeSource / RedshiftSource",
+    "PushSource / KafkaSource / KinesisSource",
+    "feast init / feast apply / feast materialize",
+    "feast ui / feast serve"
+  ]
 }

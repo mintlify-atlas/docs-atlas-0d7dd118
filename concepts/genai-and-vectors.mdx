@@ -1,0 +1,435 @@
+---
+title: "GenAI and Vectors"
+description: "Use Feast to store embeddings, perform vector similarity search, and build production-ready Retrieval Augmented Generation (RAG) applications."
+---
+
+Feast provides robust support for GenAI applications — including RAG pipelines, semantic search, and document Q&A systems. You can store embeddings as features, version them alongside your other ML features, and retrieve the most relevant documents at query time using the same proven feature serving infrastructure.
+
+## The RAG workflow with Feast
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  Document   │     │  Embedding  │     │    Feast    │     │     LLM     │
+│  Processing │────▶│  Generation │────▶│   Feature   │────▶│   Context   │
+│             │     │             │     │    Store    │     │  Generation  │
+└─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
+```
+
+<Steps>
+  <Step title="Process and chunk documents">
+    Load raw documents (PDFs, text files, web pages) and split them into semantically meaningful chunks.
+  </Step>
+  <Step title="Generate embeddings">
+    Convert text chunks to embedding vectors using a model like `sentence-transformers/all-MiniLM-L6-v2`.
+  </Step>
+  <Step title="Register a feature view with vector indexing">
+    Define a Feast `FeatureView` with a `vector_index=True` field to store and index the embeddings.
+  </Step>
+  <Step title="Materialize to the online store">
+    Run `feast apply` and materialize embeddings into the vector-capable online store.
+  </Step>
+  <Step title="Retrieve at inference time">
+    Embed the user's query, call `retrieve_online_documents_v2`, and inject retrieved context into the LLM prompt.
+  </Step>
+</Steps>
+
+---
+
+## Vector database integrations
+
+Feast integrates with several vector databases as the online store:
+
+| Vector Store | Retrieval | Indexing | `retrieve_online_documents_v2` |
+|---|---|---|---|
+| Milvus | yes | yes | yes |
+| SQLite (sqlite-vec) | yes | no | yes |
+| Elasticsearch | yes | yes | no |
+| Postgres + pgvector | yes | no | no |
+| Qdrant | yes | yes | no |
+
+<Note>
+**Milvus** and **SQLite** currently support the recommended `retrieve_online_documents_v2` API. For all other stores, use `retrieve_online_documents` (the older API, being deprecated).
+</Note>
+
+### Installation
+
+<Tabs>
+  <Tab title="Milvus">
+    ```bash
+    pip install feast[milvus]
+    ```
+  </Tab>
+  <Tab title="Elasticsearch">
+    ```bash
+    pip install feast[elasticsearch]
+    ```
+  </Tab>
+  <Tab title="Qdrant">
+    ```bash
+    pip install feast[qdrant]
+    ```
+  </Tab>
+  <Tab title="SQLite vec">
+    ```bash
+    # Requires Python 3.10 with loadable SQLite extensions
+    PYTHON_CONFIGURE_OPTS="--enable-loadable-sqlite-extensions" \
+        LDFLAGS="-L/opt/homebrew/opt/sqlite/lib" \
+        CPPFLAGS="-I/opt/homebrew/opt/sqlite/include" \
+        pyenv install 3.10.14
+
+    pip install feast[sqlite_vec]
+    ```
+  </Tab>
+  <Tab title="Postgres + pgvector">
+    ```bash
+    pip install feast[postgres]
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Configuring the vector online store
+
+<Tabs>
+  <Tab title="Milvus">
+    ```yaml
+    # feature_store.yaml
+    project: local_rag
+    provider: local
+    registry: data/registry.db
+    offline_store:
+      type: file
+    online_store:
+      type: milvus
+      path: data/online_store.db
+      vector_enabled: true
+      embedding_dim: 384
+      index_type: "IVF_FLAT"
+    entity_key_serialization_version: 3
+    ```
+  </Tab>
+  <Tab title="SQLite">
+    ```yaml
+    # feature_store.yaml
+    project: local_rag
+    provider: local
+    registry: data/registry.db
+    offline_store:
+      type: file
+    online_store:
+      type: sqlite
+      path: data/online_store.db
+      vec_enabled: true
+      embedding_dim: 384
+    ```
+  </Tab>
+  <Tab title="Postgres + pgvector">
+    ```yaml
+    # feature_store.yaml
+    project: rag_project
+    provider: local
+    registry: data/registry.db
+    offline_store:
+      type: file
+    online_store:
+      type: postgres
+      host: localhost
+      port: 5432
+      database: feast
+      db_schema: public
+      user: feast
+      password: feast
+      vector_enabled: true
+      embedding_dim: 384
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Defining a feature view for embeddings
+
+Use the `vector_index=True` flag on a `Field` to mark it as a vector embedding. Feast will configure the corresponding index in the online store automatically.
+
+```python
+from feast import FeatureView, Field, Entity, FileSource
+from feast.types import Array, Float32, Int64, String, UnixTimestamp
+from datetime import timedelta
+
+item = Entity(name="item", join_keys=["item_id"])
+author = Entity(name="author", join_keys=["author_id"])
+
+rag_documents_source = FileSource(
+    name="rag_documents_source",
+    path="data/city_wikipedia_summaries.parquet",
+    timestamp_field="event_timestamp",
+)
+
+document_embeddings = FeatureView(
+    name="city_embeddings",
+    entities=[item, author],
+    schema=[
+        Field(
+            name="vector",
+            dtype=Array(Float32),
+            vector_index=True,            # Enable vector indexing
+            vector_search_metric="COSINE",
+        ),
+        Field(name="item_id", dtype=Int64),
+        Field(name="author_id", dtype=String),
+        Field(name="sentence_chunks", dtype=String),
+        Field(name="wiki_summary", dtype=String),
+        Field(name="event_timestamp", dtype=UnixTimestamp),
+    ],
+    source=rag_documents_source,
+    ttl=timedelta(hours=24),
+)
+```
+
+---
+
+## Materializing embeddings
+
+After defining the feature view, apply the registry and write embeddings to the online store:
+
+```bash
+feast apply
+```
+
+Then write your pre-computed embedding dataframe to the online store:
+
+```python
+import pandas as pd
+from feast import FeatureStore
+
+store = FeatureStore(repo_path=".")
+
+# df has columns: item_id, author_id, vector, sentence_chunks, wiki_summary, event_timestamp
+store.write_to_online_store(feature_view_name="city_embeddings", df=df)
+```
+
+---
+
+## Generating query embeddings at inference time
+
+At inference time, embed the user's query using the same model used during ingestion:
+
+```python
+import torch
+import torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModel
+
+TOKENIZER = "sentence-transformers/all-MiniLM-L6-v2"
+MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+def mean_pooling(model_output, attention_mask):
+    token_embeddings = model_output[0]
+    input_mask_expanded = (
+        attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+    )
+    return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(
+        input_mask_expanded.sum(1), min=1e-9
+    )
+
+def embed_query(query: str) -> list[float]:
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    model = AutoModel.from_pretrained(MODEL)
+    encoded_input = tokenizer(
+        [query], padding=True, truncation=True, return_tensors="pt"
+    )
+    with torch.no_grad():
+        model_output = model(**encoded_input)
+    sentence_embeddings = mean_pooling(model_output, encoded_input["attention_mask"])
+    sentence_embeddings = F.normalize(sentence_embeddings, p=2, dim=1)
+    return sentence_embeddings.detach().cpu().numpy().tolist()[0]
+
+query = "Which city has the largest population in New York?"
+query_embedding = embed_query(query)
+```
+
+---
+
+## Retrieving context with `retrieve_online_documents_v2`
+
+```python
+from feast import FeatureStore
+
+store = FeatureStore(repo_path=".")
+
+context_data = store.retrieve_online_documents_v2(
+    features=[
+        "city_embeddings:vector",
+        "city_embeddings:item_id",
+        "city_embeddings:sentence_chunks",
+        "city_embeddings:wiki_summary",
+    ],
+    query=query_embedding,
+    top_k=3,
+    distance_metric="COSINE",
+).to_df()
+
+print(context_data[["sentence_chunks", "wiki_summary"]].head())
+```
+
+The returned dataframe contains the top-K most similar documents along with all other requested feature columns — so you can inject rich, structured context into your LLM prompt.
+
+---
+
+## Full RAG example
+
+```python
+import os
+from openai import OpenAI
+
+def format_documents(context_df, base_prompt: str) -> str:
+    context_str = "\n\n".join(
+        f"Document {i+1}:\n{row['wiki_summary']}"
+        for i, row in context_df.iterrows()
+    )
+    return f"{base_prompt}\n\nContext:\n{context_str}"
+
+BASE_PROMPT = (
+    "You are a helpful assistant. Answer the user's question using only "
+    "the context documents provided below."
+)
+
+# 1. Embed the user's question
+query_embedding = embed_query(query)
+
+# 2. Retrieve the top-3 most similar documents from Feast
+context_data = store.retrieve_online_documents_v2(
+    features=[
+        "city_embeddings:vector",
+        "city_embeddings:sentence_chunks",
+        "city_embeddings:wiki_summary",
+    ],
+    query=query_embedding,
+    top_k=3,
+    distance_metric="COSINE",
+).to_df()
+
+# 3. Build the LLM prompt with retrieved context
+full_prompt = format_documents(context_data, BASE_PROMPT)
+
+# 4. Generate the response
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+response = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[
+        {"role": "system", "content": full_prompt},
+        {"role": "user", "content": query},
+    ],
+)
+
+print(response.choices[0].message.content)
+```
+
+---
+
+## Embedding transformations with `@on_demand_feature_view`
+
+Use on-demand feature views to generate embeddings at request time from raw text:
+
+```python
+import pandas as pd
+from feast import Field, RequestSource
+from feast.on_demand_feature_view import on_demand_feature_view
+from feast.types import Array, Float32, String
+
+text_input = RequestSource(
+    name="text_input",
+    schema=[Field(name="raw_text", dtype=String)],
+)
+
+@on_demand_feature_view(
+    sources=[text_input],
+    schema=[Field(name="embedding", dtype=Array(Float32))],
+)
+def embed_text(features_df: pd.DataFrame) -> pd.DataFrame:
+    from sentence_transformers import SentenceTransformer
+
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    df = pd.DataFrame()
+    df["embedding"] = features_df["raw_text"].apply(
+        lambda text: model.encode(text).tolist()
+    )
+    return df
+```
+
+---
+
+## Model Context Protocol (MCP) support
+
+Feast can expose its feature serving endpoints as **MCP tools**, enabling AI agents to dynamically discover and use features without hardcoded definitions.
+
+```bash
+pip install feast[mcp]
+```
+
+```yaml
+# feature_store.yaml
+feature_server:
+  type: mcp
+  mcp_enabled: true
+  mcp_server_name: "feast-mcp-server"
+  mcp_server_version: "1.0.0"
+  mcp_transport: "sse"  # optional: "sse" or "stdio"
+```
+
+Once configured, AI agents using the Model Context Protocol can:
+- Call `/get-online-features` to retrieve features
+- Call `/health` to check server status
+- Discover available feature views and entities dynamically
+
+---
+
+## Scaling with Spark and Ray
+
+<CardGroup cols={2}>
+  <Card title="Apache Spark" icon="fire">
+    Use Spark to process millions of documents in parallel, generate embeddings at scale, and materialize them to vector stores using `BatchFeatureView`.
+  </Card>
+  <Card title="Ray" icon="circle-dot">
+    Use the Ray compute engine for distributed embedding generation and Kubernetes-native scaling for enterprise RAG pipelines.
+  </Card>
+</CardGroup>
+
+---
+
+## Use cases
+
+<Accordion title="Document question-answering">
+Store document chunks and embeddings in Feast. At query time, embed the user's question, retrieve the top-K relevant chunks, and provide them as context to an LLM to generate a grounded answer.
+</Accordion>
+
+<Accordion title="Knowledge base augmentation">
+Store proprietary company information as embeddings. Retrieve relevant documents for any user query and inject them into the LLM context, effectively extending the model's knowledge without fine-tuning.
+</Accordion>
+
+<Accordion title="Semantic search">
+Index product descriptions, support tickets, or any text corpus as embeddings. Convert search queries to embeddings and find semantically similar results — even when exact keywords don't match.
+</Accordion>
+
+<Accordion title="Combining embeddings with structured features">
+Use `retrieve_online_documents_v2` to retrieve both embedding-based results and structured metadata (prices, dates, categories) in a single API call, enabling richer context injection.
+</Accordion>
+
+---
+
+## Related resources
+
+<CardGroup cols={2}>
+  <Card title="Feature Retrieval" icon="magnifying-glass" href="/concepts/feature-retrieval">
+    Full documentation for `get_online_features` and `retrieve_online_documents_v2`.
+  </Card>
+  <Card title="Feature Views" icon="table" href="/concepts/feature-views">
+    Learn how to define `OnDemandFeatureView` for embedding transformations.
+  </Card>
+  <Card title="Online Stores Reference" icon="database" href="/reference/online-stores">
+    Configuration details for all supported online stores including vector stores.
+  </Card>
+  <Card title="Offline and Online Stores" icon="server" href="/concepts/offline-online-stores">
+    Understand how Feast's online store powers vector similarity search.
+  </Card>
+</CardGroup>
